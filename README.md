@@ -53,6 +53,12 @@ These resources empower developers at all experience levels to fully utilize the
 - [Templates](#templates)
     - [Applications](#applications)
     - [Extensions](#extensions)
+- [Application Streaming](#application-streaming)
+- [Custom Messaging](#custom-messaging)
+    - [Overview](#custom-messaging-overview)
+    - [Kit Side Implementation](#kit-side-implementation)
+    - [Web Client Implementation](#web-client-implementation)
+    - [Timeline Control Example](#timeline-control-example)
 - [Tools](#tools)
 - [License](#license)
 - [Additional Resources](#additional-resources)
@@ -256,6 +262,264 @@ The Omniverse Platform supports streaming Kit-based applications directly to a w
 - **Graphics Delivery Network (GDN):** Streams high-fidelity 3D content worldwide with just a shared URL.
 
 [Configuring and packaging streaming-ready Kit applications](readme-assets/additional-docs/kit_app_streaming_config.md)
+
+
+## Custom Messaging
+
+Custom messaging enables bidirectional communication between your Kit application and web clients. This is essential for building interactive streaming applications where the web UI needs to trigger actions in Omniverse or receive data from the Kit application.
+
+### Custom Messaging Overview
+
+The messaging system consists of two parts:
+- **Kit Side (Python)**: Handles incoming messages from web clients and sends responses
+- **Web Client Side (TypeScript/JavaScript)**: Sends requests and handles responses from Kit
+
+The `usd_viewer.messaging` extension template includes a `custom_messaging.py` file that demonstrates this pattern.
+
+### Kit Side Implementation
+
+#### Step 1: Create the Custom Message Manager
+
+Create a `custom_messaging.py` file in your extension's Python module:
+
+```python
+import carb
+import carb.events
+from carb.eventdispatcher import get_eventdispatcher
+import omni.kit.app
+import omni.kit.livestream.messaging as messaging
+from omni.timeline import get_timeline_interface
+
+
+class CustomMessageManager:
+    """Manages custom messages between web client and Kit application"""
+
+    def __init__(self):
+        self._subscriptions = []
+        self._timeline = get_timeline_interface()
+        carb.log_info("[CustomMessageManager] Initializing...")
+
+        # ===== REGISTER OUTGOING MESSAGES (Kit -> Web Client) =====
+        outgoing_messages = [
+            "customActionResult",       # Response to custom action requests
+            "dataUpdateNotification",   # Notify client of data changes
+            "timelineStatusResponse",   # Timeline/simulation status response
+        ]
+
+        for message_type in outgoing_messages:
+            messaging.register_event_type_to_send(message_type)
+            omni.kit.app.register_event_alias(
+                carb.events.type_from_string(message_type),
+                message_type,
+            )
+
+        # ===== REGISTER INCOMING MESSAGE HANDLERS (Web Client -> Kit) =====
+        incoming_handlers = {
+            'customActionRequest': self._on_custom_action_request,
+            'getTimelineStatus': self._on_get_timeline_status,
+            'timelineControl': self._on_timeline_control,
+        }
+
+        ed = get_eventdispatcher()
+        for event_type, handler in incoming_handlers.items():
+            omni.kit.app.register_event_alias(
+                carb.events.type_from_string(event_type),
+                event_type,
+            )
+            self._subscriptions.append(
+                ed.observe_event(
+                    observer_name=f"CustomMessageManager:{event_type}",
+                    event_name=event_type,
+                    on_event=handler
+                )
+            )
+
+        carb.log_info("[CustomMessageManager] Initialized successfully")
+
+    def _on_custom_action_request(self, event: carb.events.IEvent):
+        """Handle custom action requests from web client"""
+        payload = event.payload
+        action_type = payload.get('action_type', '')
+        parameters = payload.get('parameters', {})
+
+        # Process the action and prepare result
+        result = {"action": action_type, "status": "success"}
+
+        # Send response back to web client
+        get_eventdispatcher().dispatch_event(
+            "customActionResult",
+            payload={'action_type': action_type, 'result': result}
+        )
+
+    def on_shutdown(self):
+        """Clean up subscriptions"""
+        for sub in self._subscriptions:
+            sub.unsubscribe()
+        self._subscriptions.clear()
+```
+
+#### Step 2: Integrate with Your Extension
+
+Update your `extension.py` to initialize the CustomMessageManager:
+
+```python
+from .custom_messaging import CustomMessageManager
+import omni.ext
+
+
+class Extension(omni.ext.IExt):
+    def on_startup(self):
+        self._custom_manager = CustomMessageManager()
+
+    def on_shutdown(self):
+        if self._custom_manager:
+            self._custom_manager.on_shutdown()
+            self._custom_manager = None
+```
+
+### Web Client Implementation
+
+#### Sending Messages to Kit
+
+Use the `AppStreamer.sendMessage()` method to send messages:
+
+```typescript
+import { AppStreamer } from '@nvidia/omniverse-webrtc-streaming-library';
+
+// Send a custom action request
+function sendCustomAction(actionType: string, parameters: Record<string, any>) {
+    const message = {
+        event_type: "customActionRequest",
+        payload: {
+            action_type: actionType,
+            parameters: parameters
+        }
+    };
+    AppStreamer.sendMessage(JSON.stringify(message));
+}
+
+// Query timeline status
+function queryTimelineStatus() {
+    const message = {
+        event_type: "getTimelineStatus",
+        payload: {}
+    };
+    AppStreamer.sendMessage(JSON.stringify(message));
+}
+
+// Control timeline (play/pause/stop)
+function sendTimelineControl(action: 'play' | 'pause' | 'stop') {
+    const message = {
+        event_type: "timelineControl",
+        payload: { action: action }
+    };
+    AppStreamer.sendMessage(JSON.stringify(message));
+}
+```
+
+#### Handling Responses from Kit
+
+Handle responses in your `onCustomEvent` callback:
+
+```typescript
+function handleCustomEvent(event: any) {
+    if (!event) return;
+
+    switch (event.event_type) {
+        case "customActionResult":
+            console.log('Action result:', event.payload);
+            break;
+
+        case "timelineStatusResponse":
+            const status = event.payload;
+            console.log('Timeline mode:', status.mode);
+            console.log('Is playing:', status.is_playing);
+            console.log('Scripted mode active:', status.scripted_mode_active);
+            break;
+
+        case "dataUpdateNotification":
+            console.log('Data update:', event.payload);
+            break;
+    }
+}
+```
+
+### Timeline Control Example
+
+A common use case is controlling the simulation timeline from the web client. This is useful when you have Action Graphs that only execute during simulation playback.
+
+#### Kit Side Handler
+
+```python
+def _on_get_timeline_status(self, event: carb.events.IEvent):
+    """Handle timeline status requests"""
+    is_playing = self._timeline.is_playing()
+    is_stopped = self._timeline.is_stopped()
+
+    mode = "playing" if is_playing else ("stopped" if is_stopped else "paused")
+
+    get_eventdispatcher().dispatch_event(
+        "timelineStatusResponse",
+        payload={
+            'mode': mode,
+            'is_playing': is_playing,
+            'is_stopped': is_stopped,
+            'scripted_mode_active': is_playing,
+        }
+    )
+
+def _on_timeline_control(self, event: carb.events.IEvent):
+    """Handle timeline control requests (play/pause/stop)"""
+    action = event.payload.get('action', '')
+
+    if action == "play":
+        self._timeline.play()
+    elif action == "pause":
+        self._timeline.pause()
+    elif action == "stop":
+        self._timeline.stop()
+
+    # Send updated status
+    get_eventdispatcher().dispatch_event(
+        "timelineStatusResponse",
+        payload={
+            'mode': "playing" if self._timeline.is_playing() else "stopped",
+            'is_playing': self._timeline.is_playing(),
+            'scripted_mode_active': self._timeline.is_playing(),
+        }
+    )
+```
+
+#### Web Client Usage
+
+```typescript
+// Check if simulation is running before triggering navigation
+async function navigateToLocation(coordinates: {x: number, y: number, z: number}) {
+    // First, ensure timeline is playing (scripted mode)
+    queryTimelineStatus();
+
+    // If not playing, start the simulation
+    if (!timelineStatus.isPlaying) {
+        sendTimelineControl('play');
+    }
+
+    // Now trigger navigation action
+    sendCustomAction('navigate', coordinates);
+}
+```
+
+### Message Types Reference
+
+| Message Type | Direction | Description |
+|-------------|-----------|-------------|
+| `customActionRequest` | Web -> Kit | Request a custom action with parameters |
+| `customActionResult` | Kit -> Web | Response with action result |
+| `getTimelineStatus` | Web -> Kit | Request current timeline/simulation state |
+| `timelineControl` | Web -> Kit | Control timeline (play/pause/stop) |
+| `timelineStatusResponse` | Kit -> Web | Current timeline state information |
+| `dataUpdateNotification` | Kit -> Web | Push data updates to client |
+
+For a complete implementation example, see the [usd_viewer.messaging](./templates/extensions/usd_viewer.messaging) extension template.
 
 
 ## Tools
