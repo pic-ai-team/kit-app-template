@@ -42,13 +42,14 @@ COPY --chown=root:root --chmod=555 stream_sdk.txt /home/ubuntu/.config/regkeys.t
 # Label for discovering kit_app_template built images within the docker registry.
 LABEL kit_app_template=$KIT_FILE_NAME_BREADCRUMB
 
-# Open ports for live streaming
+# Open ports for live streaming and multi-session WebSocket
 EXPOSE 47995-48012/udp \
        47995-48012/tcp \
        49000-49007/udp \
        49000-49007/tcp \
        8011/tcp \
        8111/tcp \
+       8211/tcp \
        49100/tcp
 
 # This specifies the container's default entrypoint that will be called by "> docker run".

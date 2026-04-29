@@ -1,0 +1,22 @@
+[package]
+title = "james Multi-Session Streaming Extension"
+version = "0.1.0"
+description = "Multi-user session support via WebSocket-based JPEG frame streaming with time-sliced rendering. Serves 5-15 concurrent users from a single Kit instance."
+category = "Streaming"
+keywords = ["kit", "multi-session", "streaming", "websocket", "multi-user"]
+
+[dependencies]
+"omni.usd" = {}
+"omni.kit.viewport.utility" = {}
+"omni.kit.viewport.window" = {}
+
+[settings.exts."james.multi_session_extension"]
+ws_port = 8211
+max_sessions = 15
+render_width = 1280
+render_height = 720
+jpeg_quality = 70
+settle_frames = 2
+
+[[python.module]]
+name = "james.multi_session_extension"
