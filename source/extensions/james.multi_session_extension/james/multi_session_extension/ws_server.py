@@ -4,6 +4,7 @@ import time
 from typing import Optional
 
 import carb
+import omni.client
 import omni.usd
 
 from .session_manager import SessionManager
@@ -184,6 +185,12 @@ class WebSocketServer:
                     "data": info,
                 })
 
+        elif msg_type == "open_stage":
+            url = data.get("url", "")
+            if url:
+                carb.log_info(f"[WebSocketServer] open_stage request from {session.session_id}: {url}")
+                await self._open_stage(session, url)
+
         else:
             carb.log_warn(f"[WebSocketServer] Unknown message type: {msg_type}")
 
@@ -234,6 +241,64 @@ class WebSocketServer:
             }
         except Exception as e:
             return {"error": str(e)}
+
+    async def _open_stage(self, session, url: str):
+        try:
+            import carb.tokens
+            resolved_url = carb.tokens.acquire_tokens_interface().resolve(url)
+            usd_context = omni.usd.get_context()
+
+            stage = usd_context.get_stage()
+            if stage:
+                current = stage.GetRootLayer().identifier
+                if omni.client.utils.equal_urls(resolved_url, current):
+                    carb.log_info(f"[WebSocketServer] Stage already loaded: {resolved_url}")
+                    if not session.ws.closed:
+                        await session.ws.send_json({
+                            "type": "stage_status",
+                            "status": "already_loaded",
+                            "url": url,
+                        })
+                    return
+
+            if not session.ws.closed:
+                await session.ws.send_json({
+                    "type": "stage_status",
+                    "status": "loading",
+                    "url": url,
+                })
+
+            result, error = await usd_context.open_stage_async(
+                resolved_url, omni.usd.UsdContextInitialLoadSet.LOAD_ALL
+            )
+
+            if result:
+                carb.log_info(f"[WebSocketServer] Stage loaded: {resolved_url}")
+                self._session_mgr.rebuild_cameras_on_new_stage()
+                for s in self._session_mgr.get_all_sessions():
+                    if not s.ws.closed:
+                        await s.ws.send_json({
+                            "type": "stage_status",
+                            "status": "loaded",
+                            "url": url,
+                        })
+            else:
+                carb.log_error(f"[WebSocketServer] Failed to load stage: {error}")
+                if not session.ws.closed:
+                    await session.ws.send_json({
+                        "type": "stage_status",
+                        "status": "error",
+                        "url": url,
+                        "error": str(error),
+                    })
+        except Exception as e:
+            carb.log_error(f"[WebSocketServer] open_stage error: {e}")
+            if not session.ws.closed:
+                await session.ws.send_json({
+                    "type": "stage_status",
+                    "status": "error",
+                    "error": str(e),
+                })
 
     async def stop(self):
         for session in self._session_mgr.get_all_sessions():

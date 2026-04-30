@@ -1,0 +1,106 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+[package]
+title = "My USD Viewer Streaming"
+version = "0.1.0"
+description = "Configuration for streaming deployments of My USD Viewer"
+keywords = ["experience", "app", "dev", "streaming"]
+template_name = "omni.streaming_configuration"
+
+[dependencies]
+"multisession.my_usd_viewer" = {}  # Application kit file
+"omni.kit.livestream.app" = {}  # Livestream extension
+"james.multi_session_extension" = {}
+
+[settings.app]
+fastShutdown = true
+name = "My USD Viewer Streaming"  # Application Display Name
+renderer.resolution.height = 1080
+renderer.resolution.width = 1920
+window.height = 1080
+window.width = 1920
+
+[settings]
+rtx.post.aa.op = 3
+rtx.verifyDriverVersion.enabled = false
+
+# Fix NVST_R_ERROR_UDP_RTP_SOURCE_OPEN_FAILED_NO_PORTS_AVAILABLE
+# Omniverse Hub (spawned by Kit's hub-client) binds UDP 47998 by default.
+# NVST SDK's default streamPort is also 47998 — move it out of Hub's range.
+[settings.exts."omni.kit.livestream.app".primaryStream]
+streamPort = 62000   # UDP port for RTP media (default 47998 conflicts with Omniverse Hub)
+signalPort = 49100   # TCP signaling port (keep at default)
+
+[settings.app.extensions]
+registryEnabled = true
+supportedTargets.platform = []  # Skip checking supported platform/config when building
+
+exclude = [
+    "omni.kit.developer.bundle",
+    "omni.kit.widget.cache_indicator",
+]
+
+[settings.app.exts]
+folders.'++' = [  # Search paths for extensions.
+    "${app}/../exts",
+    "${app}/../apps",
+    "${app}/../extscache"
+]
+
+[settings.app.file]
+ignoreUnsavedOnExit = true
+
+[template]
+type = "ApplicationLayerTemplate" # Repo Template Metadata
+
+
+########################################################################################################################
+# BEGIN GENERATED PART (Remove from 'BEGIN' to 'END' to regenerate)
+########################################################################################################################
+
+# Kit SDK Version: 109.0.2+production.256998.bb24931b.gl
+
+# Version lock for all dependencies:
+[settings.app.exts]
+enabled = [
+	"omni.anim.curve.core-1.5.3",
+	"omni.anim.timeline-109.0.1",
+	"omni.graph.action-2.0.0",
+	"omni.graph.action_nodes-2.0.3",
+	"omni.graph.action_nodes_core-2.0.1",
+	"omni.graph.nodes-2.1.6",
+	"omni.graph.nodes_core-2.0.3",
+	"omni.graph.scriptnode-2.1.2",
+	"omni.graph.ui_nodes-2.0.4",
+	"omni.kit.data2ui.core-1.1.4",
+	"omni.kit.data2ui.usd-1.1.4",
+	"omni.kit.livestream.app-9.0.0",
+	"omni.kit.livestream.core-9.0.0",
+	"omni.kit.livestream.messaging-1.2.1",
+	"omni.kit.livestream.webrtc-9.0.2",
+	"omni.kit.sequencer.core-108.1.1",
+	"omni.kit.sequencer.usd-108.1.1",
+	"omni.no_code_ui.bundle-1.1.4",
+	"omni.usd.schema.sequence-3.1.2",
+	"omni.usd_viewer.samples-106.3.3",
+]
+
+########################################################################################################################
+# END GENERATED PART
+########################################################################################################################
+
+[settings.exts."james.multi_session_extension"]
+ws_port = 8211
+max_sessions = 15
+render_width = 1280
+render_height = 720
+jpeg_quality = 75
+settle_frames = 1

@@ -15,8 +15,8 @@ ws_port = 8211
 max_sessions = 15
 render_width = 1280
 render_height = 720
-jpeg_quality = 70
-settle_frames = 2
+jpeg_quality = 75
+settle_frames = 1
 
 [[python.module]]
 name = "james.multi_session_extension"

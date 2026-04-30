@@ -1,19 +1,11 @@
 import asyncio
 import io
 import time
-from enum import Enum, auto
 from typing import Optional
 
 import carb
-import omni.kit.app
 
 from .session_manager import SessionManager, UserSession
-
-
-class _RenderState(Enum):
-    IDLE = auto()
-    SETTLING = auto()
-    CAPTURE = auto()
 
 
 class MultiRenderer:
@@ -30,155 +22,155 @@ class MultiRenderer:
         self._render_height = render_height
         self._jpeg_quality = jpeg_quality
         self._settle_frames = settle_frames
-
-        self._state = _RenderState.IDLE
-        self._settle_counter = 0
-        self._current_session: Optional[UserSession] = None
-        self._capture_in_progress = False
-        self._update_sub = None
-        self._hidden_vp = None
-        self._viewport_api = None
         self._running = False
+        self._loop_task = None
 
         self._has_pil = False
+        self._first_capture_logged = False
         try:
             from PIL import Image  # noqa: F401
             self._has_pil = True
         except ImportError:
-            carb.log_warn(
-                "[MultiRenderer] PIL not available, will send PNG frames (larger). "
-                "Install Pillow for JPEG encoding."
-            )
+            carb.log_warn("[MultiRenderer] PIL not available, sending raw frames.")
 
         carb.log_info(
-            f"[MultiRenderer] Initialized ({render_width}x{render_height}, "
-            f"q={jpeg_quality}, settle={settle_frames}, pil={self._has_pil})"
+            f"[MultiRenderer] Init ({render_width}x{render_height}, "
+            f"q={jpeg_quality}, settle={settle_frames})"
         )
 
     def start(self):
-        try:
-            from omni.kit.viewport.window import ViewportWindow
-
-            self._hidden_vp = ViewportWindow(
-                "MultiSessionVP",
-                visible=False,
-                width=self._render_width,
-                height=self._render_height,
-            )
-            self._viewport_api = self._hidden_vp.viewport_api
-            carb.log_info("[MultiRenderer] Hidden viewport created: MultiSessionVP")
-        except Exception as e:
-            carb.log_error(f"[MultiRenderer] Failed to create hidden viewport: {e}")
-            carb.log_info("[MultiRenderer] Falling back to main Viewport")
-            from omni.kit.viewport.utility import get_viewport_from_window_name
-            self._viewport_api = get_viewport_from_window_name("Viewport")
-
         self._running = True
-        self._state = _RenderState.IDLE
-
-        self._update_sub = (
-            omni.kit.app.get_app()
-            .get_update_event_stream()
-            .create_subscription_to_pop(self._on_update, name="MultiRenderer")
-        )
-
+        self._loop_task = asyncio.ensure_future(self._render_loop())
         carb.log_info("[MultiRenderer] Render loop started")
 
     def stop(self):
         self._running = False
+        if self._loop_task:
+            self._loop_task.cancel()
+            self._loop_task = None
+        carb.log_info("[MultiRenderer] Stopped")
 
-        if self._update_sub:
-            self._update_sub = None
-
-        if self._hidden_vp:
+    async def _render_loop(self):
+        while self._running:
             try:
-                self._hidden_vp.destroy()
-            except Exception:
-                pass
-            self._hidden_vp = None
-            self._viewport_api = None
+                session = self._session_mgr.get_next_session()
+                if session is None:
+                    await asyncio.sleep(0.1)
+                    continue
 
-        carb.log_info("[MultiRenderer] Render loop stopped")
+                if session.ws is None or session.ws.closed:
+                    continue
 
-    def _on_update(self, event):
-        if not self._running:
-            return
+                if session.viewport_api is None:
+                    continue
 
-        if self._state == _RenderState.IDLE:
-            session = self._session_mgr.get_next_session()
-            if session is None:
-                return
+                # Wait for this user's viewport to render
+                await session.viewport_api.wait_for_rendered_frames(self._settle_frames)
 
-            self._current_session = session
+                # Capture from this user's dedicated viewport
+                capture_result = await self._capture_frame(session.viewport_api)
+                if capture_result is None:
+                    continue
 
-            try:
-                if self._viewport_api:
-                    self._viewport_api.camera_path = session.camera_prim_path
+                frame_data, cap_width, cap_height = capture_result
+
+                if not self._first_capture_logged:
+                    self._first_capture_logged = True
+                    carb.log_info(
+                        f"[MultiRenderer] First capture: {cap_width}x{cap_height}, "
+                        f"expected {self._render_width}x{self._render_height}, "
+                        f"buffer={len(frame_data)} bytes, "
+                        f"session={session.session_id}"
+                    )
+
+                frame_bytes = self._encode_frame(frame_data, cap_width, cap_height)
+                if frame_bytes is None:
+                    continue
+
+                try:
+                    if not session.ws.closed:
+                        await session.ws.send_bytes(frame_bytes)
+                        session.frames_sent += 1
+                        session.last_frame_time = time.time()
+                except Exception:
+                    pass
+
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                carb.log_error(f"[MultiRenderer] Failed to set camera path: {e}")
-                return
+                carb.log_error(f"[MultiRenderer] Loop error: {e}")
+                await asyncio.sleep(0.1)
 
-            self._settle_counter = self._settle_frames
-            self._state = _RenderState.SETTLING
-
-        elif self._state == _RenderState.SETTLING:
-            self._settle_counter -= 1
-            if self._settle_counter <= 0:
-                self._state = _RenderState.CAPTURE
-
-        elif self._state == _RenderState.CAPTURE:
-            if not self._capture_in_progress and self._current_session:
-                self._capture_in_progress = True
-                asyncio.ensure_future(
-                    self._capture_and_send(self._current_session)
-                )
-            self._state = _RenderState.IDLE
-
-    async def _capture_and_send(self, session: UserSession):
+    async def _capture_frame(self, viewport_api):
         try:
-            if session.ws is None or session.ws.closed:
-                return
+            from omni.kit.widget.viewport.capture import ByteCapture
 
-            from omni.kit.viewport.utility import capture_viewport_to_buffer
+            loop = asyncio.get_event_loop()
+            future = loop.create_future()
+            result = [None, 0, 0]
 
-            vp_name = "MultiSessionVP" if self._hidden_vp else "Viewport"
+            def on_capture(buffer, buffer_size, width, height, fmt):
+                try:
+                    if buffer is not None and buffer_size > 0:
+                        import ctypes
+                        buf_type = type(buffer).__name__
+                        if buf_type == 'PyCapsule':
+                            ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+                            ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [
+                                ctypes.py_object, ctypes.c_char_p
+                            ]
+                            ptr = ctypes.pythonapi.PyCapsule_GetPointer(buffer, None)
+                            if ptr:
+                                result[0] = ctypes.string_at(ptr, buffer_size)
+                        elif isinstance(buffer, (bytes, bytearray)):
+                            result[0] = bytes(buffer)
+                        elif isinstance(buffer, int):
+                            result[0] = ctypes.string_at(buffer, buffer_size)
+                        elif hasattr(buffer, '__array_interface__'):
+                            import numpy as np
+                            result[0] = np.array(buffer, copy=False).tobytes()
+                        else:
+                            result[0] = bytes(memoryview(buffer))
+                        result[1] = width
+                        result[2] = height
+                except Exception as e:
+                    carb.log_error(f"[MultiRenderer] Capture cb error: {e}")
+                finally:
+                    if not future.done():
+                        future.set_result(True)
 
-            buffer = await capture_viewport_to_buffer(
-                viewport_api_name=vp_name,
-                width=self._render_width,
-                height=self._render_height,
-            )
+            viewport_api.schedule_capture(ByteCapture(on_capture))
+            await asyncio.wait_for(future, timeout=5.0)
 
-            if buffer is None:
-                return
+            if result[0] is None:
+                return None
+            return (result[0], result[1], result[2])
 
-            frame_bytes = self._encode_frame(buffer)
-            if frame_bytes is None:
-                return
-
-            if not session.ws.closed:
-                await session.ws.send_bytes(frame_bytes)
-                session.frames_sent += 1
-                session.last_frame_time = time.time()
-
-        except ConnectionResetError:
-            pass
+        except asyncio.TimeoutError:
+            carb.log_warn("[MultiRenderer] Capture timed out")
+            return None
         except Exception as e:
-            carb.log_error(f"[MultiRenderer] Capture/send error for {session.session_id}: {e}")
-        finally:
-            self._capture_in_progress = False
+            carb.log_error(f"[MultiRenderer] Capture error: {e}")
+            return None
 
-    def _encode_frame(self, png_buffer: bytes) -> Optional[bytes]:
+    def _encode_frame(self, raw_buffer: bytes, width: int, height: int) -> Optional[bytes]:
         try:
             if self._has_pil:
                 from PIL import Image
-                img = Image.open(io.BytesIO(png_buffer))
+                expected_size = width * height * 4
+                if len(raw_buffer) != expected_size:
+                    carb.log_warn(
+                        f"[MultiRenderer] Buffer size mismatch: got {len(raw_buffer)}, "
+                        f"expected {expected_size} for {width}x{height} RGBA"
+                    )
+                    return None
+                img = Image.frombytes("RGBA", (width, height), raw_buffer)
                 img = img.convert("RGB")
                 output = io.BytesIO()
                 img.save(output, format="JPEG", quality=self._jpeg_quality)
                 return output.getvalue()
             else:
-                return png_buffer
+                return raw_buffer
         except Exception as e:
-            carb.log_error(f"[MultiRenderer] Frame encode error: {e}")
+            carb.log_error(f"[MultiRenderer] Encode error: {e}")
             return None
