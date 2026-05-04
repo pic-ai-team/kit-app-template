@@ -8,9 +8,13 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import asyncio
+
 from .stage_loading import LoadingManager
 from .stage_management import StageManager
 from .custom_messaging import CustomMessageManager  # ADD THIS IMPORT
+from .api_server import start_api_server, stop_api_server
+from .cctv_capture import get_cctv_capture
 import omni.ext
 
 
@@ -29,6 +33,9 @@ class Extension(omni.ext.IExt):
         self._stage_manager: StageManager = StageManager()
         self._custom_manager: CustomMessageManager = CustomMessageManager()  # ADD THIS LINE
 
+        # Start API HTTP server (allows agent backend to capture frames directly)
+        asyncio.ensure_future(start_api_server(port=8100))
+
     def on_shutdown(self):
         """This is called every time the extension is deactivated. It is used to
         clean up the extension state."""
@@ -43,3 +50,6 @@ class Extension(omni.ext.IExt):
         if self._custom_manager:
             self._custom_manager.on_shutdown()
             self._custom_manager = None
+        # Stop API server and cleanup capture resources
+        asyncio.ensure_future(stop_api_server())
+        get_cctv_capture().shutdown()
