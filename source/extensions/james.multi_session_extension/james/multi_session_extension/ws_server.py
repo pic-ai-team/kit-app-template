@@ -8,6 +8,8 @@ import omni.client
 import omni.usd
 
 from .session_manager import SessionManager
+from .agent_client import AgentClient, AgentAction, ChatRequest
+from .camera_navigation import CameraNavigation
 
 
 class WebSocketServer:
@@ -15,9 +17,13 @@ class WebSocketServer:
         self,
         session_manager: SessionManager,
         port: int = 8211,
+        agent_client: AgentClient = None,
+        camera_nav: CameraNavigation = None,
     ):
         self._session_mgr = session_manager
         self._port = port
+        self._agent_client = agent_client
+        self._camera_nav = camera_nav
         self._runner = None
         self._site = None
         self._app = None
@@ -191,8 +197,113 @@ class WebSocketServer:
                 carb.log_info(f"[WebSocketServer] open_stage request from {session.session_id}: {url}")
                 await self._open_stage(session, url)
 
+        elif msg_type == "chat_message":
+            await self._handle_chat(session, data)
+
+        elif msg_type == "get_nav_positions":
+            await self._handle_get_nav_positions(session)
+
+        elif msg_type == "navigate_to":
+            await self._handle_navigate_to(session, data)
+
         else:
             carb.log_warn(f"[WebSocketServer] Unknown message type: {msg_type}")
+
+    async def _handle_chat(self, session, data: dict):
+        if not self._agent_client:
+            if not session.ws.closed:
+                await session.ws.send_json({
+                    "type": "chat_response",
+                    "message": "Chat is not available — agent backend not configured.",
+                    "request_id": data.get("request_id", ""),
+                })
+            return
+
+        request_id = data.get("request_id", "")
+        message = data.get("message", "").strip()
+        if not message:
+            return
+
+        try:
+            if not session.ws.closed:
+                await session.ws.send_json({"type": "chat_typing", "is_typing": True})
+
+            request = ChatRequest(
+                message=message,
+                session_id=session.session_id,
+                context={
+                    "position": session.position,
+                    "rotation": session.rotation,
+                    "fov": session.fov,
+                },
+            )
+            response = await self._agent_client.send_chat_message(request)
+
+            if not session.ws.closed:
+                await session.ws.send_json({"type": "chat_typing", "is_typing": False})
+
+            if response.action == AgentAction.NAVIGATE_TO and response.action_params:
+                dest = response.action_params.get("destination", "")
+                if dest and self._camera_nav:
+                    asyncio.ensure_future(self._camera_nav.navigate_to(session, dest))
+
+            if not session.ws.closed:
+                await session.ws.send_json({
+                    "type": "chat_response",
+                    "message": response.message,
+                    "request_id": request_id,
+                    "metadata": response.metadata,
+                    "action": response.action.value if response.action else "none",
+                    "action_params": response.action_params,
+                })
+
+        except Exception as e:
+            carb.log_error(f"[WebSocketServer] Chat error for {session.session_id}: {e}")
+            if not session.ws.closed:
+                await session.ws.send_json({"type": "chat_typing", "is_typing": False})
+                await session.ws.send_json({
+                    "type": "chat_response",
+                    "message": f"Error: {e}",
+                    "request_id": request_id,
+                })
+
+    async def _handle_get_nav_positions(self, session):
+        if not self._camera_nav:
+            if not session.ws.closed:
+                await session.ws.send_json({
+                    "type": "nav_positions",
+                    "positions": {},
+                })
+            return
+
+        positions = self._camera_nav.get_all_positions()
+        if not session.ws.closed:
+            await session.ws.send_json({
+                "type": "nav_positions",
+                "positions": positions,
+            })
+
+    async def _handle_navigate_to(self, session, data: dict):
+        if not self._camera_nav:
+            return
+
+        destination = data.get("destination", "")
+        instant = data.get("instant", False)
+        speed = data.get("speed", 1.0)
+
+        if not destination:
+            return
+
+        self._camera_nav.stop_animation(session.session_id)
+
+        success = await self._camera_nav.navigate_to(
+            session, destination, speed=speed, instant=instant
+        )
+        if not success and not session.ws.closed:
+            await session.ws.send_json({
+                "type": "error",
+                "message": f"Location '{destination}' not found",
+            })
 
     def _collect_markers(self) -> list:
         markers = []

@@ -1,5 +1,6 @@
 import asyncio
 import math
+import os
 
 import carb
 import carb.settings
@@ -9,6 +10,8 @@ import omni.usd
 from .session_manager import SessionManager
 from .multi_renderer import MultiRenderer
 from .ws_server import WebSocketServer
+from .agent_client import AgentClient
+from .camera_navigation import CameraNavigation
 
 
 class Extension(omni.ext.IExt):
@@ -41,6 +44,12 @@ class Extension(omni.ext.IExt):
         self._ws_server = None
         self._renderer_started = False
 
+        agent_url = settings.get(f"{prefix}/agent_backend_url") or "http://172.20.166.3:8000"
+        self._agent_client = AgentClient(base_url=agent_url)
+
+        presets_path = os.path.join(os.path.dirname(__file__), "nav_presets.json")
+        self._camera_nav = CameraNavigation(presets_path=presets_path)
+
         self._session_manager = SessionManager(
             max_sessions=self._max_sessions,
             render_width=self._render_width,
@@ -50,8 +59,12 @@ class Extension(omni.ext.IExt):
         self._ws_server = WebSocketServer(
             session_manager=self._session_manager,
             port=self._ws_port,
+            agent_client=self._agent_client,
+            camera_nav=self._camera_nav,
         )
         self._ws_server.start()
+
+        asyncio.ensure_future(self._check_agent_health())
 
         self._renderer = MultiRenderer(
             session_manager=self._session_manager,
@@ -132,6 +145,13 @@ class Extension(omni.ext.IExt):
 
         except Exception as e:
             carb.log_error(f"[MultiSession-DIAG] Error reading cameras: {e}")
+
+    async def _check_agent_health(self):
+        ok = await self._agent_client.health_check()
+        if ok:
+            carb.log_info("[MultiSessionExtension] Agent backend is reachable")
+        else:
+            carb.log_warn("[MultiSessionExtension] Agent backend is NOT reachable — chat will be unavailable")
 
     def _start_renderer(self):
         if self._renderer_started or self._renderer is None:
