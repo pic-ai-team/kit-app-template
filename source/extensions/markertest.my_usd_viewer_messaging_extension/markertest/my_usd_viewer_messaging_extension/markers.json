@@ -1,0 +1,100 @@
+{
+  "coffee_machine": {
+    "label": "Coffee Machine",
+    "description": "Self-service coffee station",
+    "position": [
+      346.64811056828535,
+      577.5242271632544,
+      230.4247588182296
+    ],
+    "rotation": [
+      76.25558471679689,
+      0.10017842799425128,
+      -6.514422416687013
+    ]
+  },
+  "coconut_water": {
+    "label": "Coconut Water",
+    "description": "Coconut water section",
+    "position": [
+      -603.6593851549262,
+      1622.6953737259955,
+      132.026299689495
+    ],
+    "rotation": [
+      86.80848693847658,
+      0.10017842799425127,
+      -94.37071228027344
+    ]
+  },
+  "cheetos": {
+    "label": "Cheetos",
+    "description": "Cheetos snack aisle",
+    "position": [
+      -318.74268223134123,
+      782.3119322064731,
+      166.16356925000403
+    ],
+    "rotation": [
+      69.09728240966797,
+      0.10017842799425128,
+      -1.776652455329895
+    ]
+  },
+  "pringles": {
+    "label": "Pringles",
+    "description": "Pringles snack display",
+    "position": [
+      -433.8443909125817,
+      788.8048224993478,
+      152.53619348022104
+    ],
+    "rotation": [
+      72.32945251464845,
+      0.10017842799425128,
+      -0.5884832143783569
+    ]
+  },
+  "freezer_food": {
+    "label": "freezer food",
+    "description": "freezer rice",
+    "position": [
+      -284.33200356938966,
+      874.057725964858,
+      150.8100640645048
+    ],
+    "rotation": [
+      89.92534637451172,
+      0.10017842799425128,
+      73.72916412353514
+    ]
+  },
+  "quick_snacks": {
+    "label": "quick snacks",
+    "description": "quick snacks",
+    "position": [
+      -399.533598381143,
+      959.53059120515,
+      155.41546433533745
+    ],
+    "rotation": [
+      87.5259246826172,
+      0.10017842799425128,
+      87.9940185546875
+    ]
+  },
+  "chocolate": {
+    "label": "chocolate",
+    "description": "chocolate",
+    "position": [
+      -213.48137508152521,
+      451.0064481024283,
+      186.64931324804618
+    ],
+    "rotation": [
+      70.99204254150392,
+      0.10017842799425128,
+      3.9201571941375737
+    ]
+  }
+}

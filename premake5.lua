@@ -15,3 +15,8 @@ repo_build.prebuild_copy {
 }
 
 -- Apps: for each app generate batch files and a project based on kit files (e.g. my_name.my_app.kit)
+
+define_app("multisession.my_usd_viewer.kit")
+
+define_app("markertest.my_usd_viewer.kit")
+define_app("markertest.my_usd_viewer_streaming.kit")

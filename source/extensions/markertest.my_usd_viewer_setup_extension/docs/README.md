@@ -1,0 +1,1 @@
+# My USD Viewer Setup Extension [markertest.my_usd_viewer_setup_extension]
