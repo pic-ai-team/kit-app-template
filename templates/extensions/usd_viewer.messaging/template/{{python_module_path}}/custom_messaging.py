@@ -40,6 +40,16 @@ class CustomMessageManager:
         # Camera navigation for moving to store locations
         self._camera_navigation: CameraNavigation = get_camera_navigation()
 
+        # Waypoint markers
+        self._markers: Dict[str, Dict[str, Any]] = {}
+        self._markers_file = self._resolve_markers_file()
+        self._load_markers()
+        self._selection_sub = None
+
+        # Camera broadcast state (for playlist/navigation panel)
+        self._camera_broadcast_running = False
+        self._last_broadcast_camera: Optional[Dict[str, Any]] = None
+
         carb.log_info("[CustomMessageManager] Initializing...")
 
         # ===== REGISTER OUTGOING MESSAGES (Kit -> Web Client) =====
@@ -60,6 +70,10 @@ class CustomMessageManager:
             "navPositionsResponse",      # Full positions list (after any CRUD operation)
             "cameraPositionResponse",    # Current camera position query result
             "navRoutesResponse",         # Waypoint routes list
+            # Waypoint markers
+            "markersResponse",           # Full marker list
+            "markerInfoResponse",        # AI-generated info for a clicked marker
+            "cameraPositionUpdate",      # Camera transform for playlist/navigation panel
         ]
 
         for message_type in outgoing_messages:
@@ -98,6 +112,13 @@ class CustomMessageManager:
             'saveNavRoute':        self._on_save_nav_route,
             'deleteNavRoute':      self._on_delete_nav_route,
             'getNavRoutes':        self._on_get_nav_routes,
+            # Waypoint markers
+            'getMarkers':          self._on_get_markers,
+            'createMarker':        self._on_create_marker,
+            'deleteMarker':        self._on_delete_marker,
+            'clickMarker':         self._on_click_marker,
+            'startCameraBroadcast': self._on_start_camera_broadcast,
+            'stopCameraBroadcast':  self._on_stop_camera_broadcast,
         }
 
         ed = get_eventdispatcher()
@@ -115,6 +136,9 @@ class CustomMessageManager:
                     on_event=handler
                 )
             )
+
+        # Setup 3D waypoint selection listener for click detection
+        self._setup_waypoint_selection_listener()
 
         carb.log_info("[CustomMessageManager] Initialized successfully")
 
@@ -1294,12 +1318,15 @@ class CustomMessageManager:
                 rz = 0.0
             rotation = [rx, ry, rz]
 
+            # Forward vector (-Z axis of the camera in world space)
+            forward = [-m[2][0], -m[2][1], -m[2][2]]
+
             carb.log_info(
                 f"[CustomMessageManager] Camera: "
                 f"t=({location[0]:.1f},{location[1]:.1f},{location[2]:.1f}) "
                 f"r=({rotation[0]:.2f},{rotation[1]:.2f},{rotation[2]:.2f})"
             )
-            return {"location": location, "rotation": rotation}
+            return {"location": location, "rotation": rotation, "forward": forward}
 
         except Exception as e:
             import traceback
@@ -1425,9 +1452,437 @@ class CustomMessageManager:
 
     # ===== END CAMERA NAV POSITION REGISTRY =====
 
+    # ===== WAYPOINT MARKERS (USD-PRIM BASED) =====
+
+    WAYPOINTS_ROOT = "/World/Waypoints"
+
+    def _resolve_markers_file(self) -> str:
+        import os
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "markers.json")
+
+    def _load_markers(self) -> None:
+        import json as _json
+        import os
+        try:
+            if os.path.exists(self._markers_file):
+                with open(self._markers_file, "r") as f:
+                    self._markers = _json.load(f)
+                carb.log_info(f"[CustomMessageManager] Loaded {len(self._markers)} markers")
+            else:
+                self._markers = {}
+                carb.log_info("[CustomMessageManager] No markers.json found, starting empty")
+        except Exception as e:
+            carb.log_warn(f"[CustomMessageManager] Failed to load markers: {e}")
+            self._markers = {}
+
+    def _save_markers(self) -> None:
+        import json as _json
+        try:
+            with open(self._markers_file, "w") as f:
+                _json.dump(self._markers, f, indent=2)
+            carb.log_info(f"[CustomMessageManager] Saved {len(self._markers)} markers")
+        except Exception as e:
+            carb.log_error(f"[CustomMessageManager] Failed to save markers: {e}")
+
+    def _dispatch_markers(self) -> None:
+        markers_list = []
+        for key, data in self._markers.items():
+            markers_list.append({
+                "key": key,
+                "label": data.get("label", key),
+                "description": data.get("description", ""),
+                "position": data.get("position", [0, 0, 0]),
+                "rotation": data.get("rotation", [0, 0, 0]),
+            })
+        get_eventdispatcher().dispatch_event(
+            "markersResponse",
+            payload={"markers": markers_list}
+        )
+
+    def _on_get_markers(self, event: carb.events.IEvent) -> None:
+        carb.log_info("[CustomMessageManager] getMarkers received")
+        self._sync_markers_to_stage()
+        self._dispatch_markers()
+
+    # ── 3D Prim Creation ─────────────────────────────────────────────────
+
+    def _create_marker_prim(self, key: str, label: str, position: list) -> None:
+        """Create a visible 3D pin marker prim in the USD stage."""
+        try:
+            import omni.usd
+            from pxr import UsdGeom, Gf, Sdf, UsdShade
+
+            stage = omni.usd.get_context().get_stage()
+            if not stage:
+                carb.log_warn("[CustomMessageManager] No stage — cannot create marker prim")
+                return
+
+            root_path = self.WAYPOINTS_ROOT
+            # Ensure /World/Waypoints exists
+            if not stage.GetPrimAtPath(root_path):
+                UsdGeom.Xform.Define(stage, root_path)
+
+            marker_path = f"{root_path}/{key}"
+            # Remove existing prim if present
+            existing = stage.GetPrimAtPath(marker_path)
+            if existing and existing.IsValid():
+                stage.RemovePrim(marker_path)
+
+            # Create marker Xform at position
+            marker_xform = UsdGeom.Xform.Define(stage, marker_path)
+            translate_op = marker_xform.AddTranslateOp()
+            translate_op.Set(Gf.Vec3d(position[0], position[1], position[2]))
+
+            # Store metadata as custom attributes
+            prim = stage.GetPrimAtPath(marker_path)
+            prim.CreateAttribute("waypoint:label", Sdf.ValueTypeNames.String).Set(label)
+            desc = self._markers.get(key, {}).get("description", "")
+            prim.CreateAttribute("waypoint:description", Sdf.ValueTypeNames.String).Set(desc)
+            rot = self._markers.get(key, {}).get("rotation", [0, 0, 0])
+            prim.CreateAttribute("waypoint:cameraRotation", Sdf.ValueTypeNames.Float3).Set(
+                Gf.Vec3f(rot[0], rot[1], rot[2])
+            )
+
+            # ── Pin body: Cone (pointing down) ──
+            cone_path = f"{marker_path}/pin_body"
+            cone = UsdGeom.Cone.Define(stage, cone_path)
+            cone.GetRadiusAttr().Set(8.0)
+            cone.GetHeightAttr().Set(20.0)
+            cone.GetAxisAttr().Set("Z")
+            # Rotate 180° so tip points down, offset upward
+            cone_xform = UsdGeom.Xformable(cone.GetPrim())
+            cone_xform.AddTranslateOp().Set(Gf.Vec3d(0, 0, 25))
+            cone_xform.AddRotateXYZOp().Set(Gf.Vec3f(180, 0, 0))
+            cone.GetDisplayColorAttr().Set([Gf.Vec3f(0.46, 0.73, 0.0)])  # NVIDIA green
+
+            # ── Pin head: Sphere on top ──
+            sphere_path = f"{marker_path}/pin_head"
+            sphere = UsdGeom.Sphere.Define(stage, sphere_path)
+            sphere.GetRadiusAttr().Set(10.0)
+            sphere_xform = UsdGeom.Xformable(sphere.GetPrim())
+            sphere_xform.AddTranslateOp().Set(Gf.Vec3d(0, 0, 40))
+            sphere.GetDisplayColorAttr().Set([Gf.Vec3f(0.46, 0.73, 0.0)])  # NVIDIA green
+
+            carb.log_info(f"[CustomMessageManager] Created 3D marker prim: {marker_path}")
+
+        except Exception as e:
+            import traceback
+            carb.log_error(f"[CustomMessageManager] Failed to create marker prim '{key}': {e}")
+            carb.log_error(traceback.format_exc())
+
+    def _delete_marker_prim(self, key: str) -> None:
+        """Remove a marker prim from the USD stage."""
+        try:
+            import omni.usd
+            stage = omni.usd.get_context().get_stage()
+            if not stage:
+                return
+            marker_path = f"{self.WAYPOINTS_ROOT}/{key}"
+            prim = stage.GetPrimAtPath(marker_path)
+            if prim and prim.IsValid():
+                stage.RemovePrim(marker_path)
+                carb.log_info(f"[CustomMessageManager] Removed marker prim: {marker_path}")
+        except Exception as e:
+            carb.log_error(f"[CustomMessageManager] Failed to delete marker prim '{key}': {e}")
+
+    def _sync_markers_to_stage(self) -> None:
+        """Ensure all markers in memory have corresponding 3D prims on stage."""
+        try:
+            import omni.usd
+            stage = omni.usd.get_context().get_stage()
+            if not stage:
+                return
+            for key, data in self._markers.items():
+                marker_path = f"{self.WAYPOINTS_ROOT}/{key}"
+                if not stage.GetPrimAtPath(marker_path) or not stage.GetPrimAtPath(marker_path).IsValid():
+                    self._create_marker_prim(key, data.get("label", key), data.get("position", [0, 0, 0]))
+            carb.log_info(f"[CustomMessageManager] Synced {len(self._markers)} markers to stage")
+        except Exception as e:
+            carb.log_error(f"[CustomMessageManager] Failed to sync markers to stage: {e}")
+
+    # ── Selection-based click detection ──────────────────────────────────
+
+    def _setup_waypoint_selection_listener(self) -> None:
+        """Listen for USD prim selection changes to detect clicks on waypoint markers."""
+        try:
+            import omni.usd
+            usd_context = omni.usd.get_context()
+            selection = usd_context.get_selection()
+
+            events = usd_context.get_stage_event_stream()
+            self._selection_sub = events.create_subscription_to_pop(
+                self._on_stage_selection_changed,
+                name="WaypointMarkerSelectionListener"
+            )
+            self._subscriptions.append(self._selection_sub)
+            carb.log_info("[CustomMessageManager] Waypoint selection listener active")
+        except Exception as e:
+            carb.log_warn(f"[CustomMessageManager] Could not setup selection listener: {e}")
+
+    def _on_stage_selection_changed(self, event) -> None:
+        """Handle stage events — check if a waypoint prim was selected."""
+        import omni.usd
+        if event.type != int(omni.usd.StageEventType.SELECTION_CHANGED):
+            return
+
+        try:
+            usd_context = omni.usd.get_context()
+            selection = usd_context.get_selection()
+            paths = selection.get_selected_prim_paths()
+
+            if not paths:
+                return
+
+            for path in paths:
+                # Check if selected prim is under /World/Waypoints/
+                if not path.startswith(self.WAYPOINTS_ROOT + "/"):
+                    continue
+
+                # Extract marker key from path: /World/Waypoints/cheetos/pin_body → cheetos
+                relative = path[len(self.WAYPOINTS_ROOT) + 1:]
+                key = relative.split("/")[0]
+
+                if key in self._markers:
+                    carb.log_info(f"[CustomMessageManager] Waypoint prim clicked: '{key}'")
+                    # Clear selection to avoid re-triggering
+                    selection.clear_selected_prim_paths()
+                    # Trigger the marker click flow
+                    marker = self._markers[key]
+                    get_eventdispatcher().dispatch_event(
+                        "markerInfoResponse",
+                        payload={
+                            "key": key,
+                            "label": marker.get("label", key),
+                            "message": "",
+                            "loading": True,
+                        }
+                    )
+                    asyncio.ensure_future(self._do_click_marker(key, marker))
+                    return  # Only handle the first waypoint match
+        except Exception as e:
+            carb.log_warn(f"[CustomMessageManager] Selection handler error: {e}")
+
+    # ── Marker CRUD and interaction ──────────────────────────────────────
+
+    def _on_create_marker(self, event: carb.events.IEvent) -> None:
+        payload = event.payload
+        name = payload.get("name", "").strip()
+        description = payload.get("description", name)
+
+        if not name:
+            carb.log_warn("[CustomMessageManager] createMarker: empty name ignored")
+            return
+
+        pos = self._read_camera_position_robust()
+        if not pos:
+            carb.log_warn("[CustomMessageManager] createMarker: could not read camera position")
+            return
+
+        # Project the marker position 150 units in front of the camera
+        distance = 150.0
+        location = pos["location"]
+        forward = pos["forward"]
+        projected_location = [
+            location[0] + forward[0] * distance,
+            location[1] + forward[1] * distance,
+            location[2] + forward[2] * distance
+        ]
+
+        key = name.lower().replace(" ", "_")
+        self._markers[key] = {
+            "label": name,
+            "description": description,
+            "position": projected_location,
+            "rotation": pos["rotation"],
+        }
+        self._save_markers()
+        self._create_marker_prim(key, name, projected_location)
+        carb.log_info(f"[CustomMessageManager] Created marker '{key}' at {projected_location}")
+        self._dispatch_markers()
+
+    def _on_delete_marker(self, event: carb.events.IEvent) -> None:
+        key = event.payload.get("key", "").strip()
+        if key in self._markers:
+            del self._markers[key]
+            self._save_markers()
+            self._delete_marker_prim(key)
+            carb.log_info(f"[CustomMessageManager] Deleted marker '{key}'")
+        else:
+            carb.log_warn(f"[CustomMessageManager] deleteMarker: key '{key}' not found")
+        self._dispatch_markers()
+
+    def _on_click_marker(self, event: carb.events.IEvent) -> None:
+        key = event.payload.get("key", "").strip()
+        if key not in self._markers:
+            carb.log_warn(f"[CustomMessageManager] clickMarker: key '{key}' not found")
+            return
+
+        marker = self._markers[key]
+        carb.log_info(f"[CustomMessageManager] clickMarker '{key}' — navigating + querying agent")
+        asyncio.ensure_future(self._do_click_marker(key, marker))
+
+    async def _do_click_marker(self, key: str, marker: Dict[str, Any]) -> None:
+        label = marker.get("label", key)
+        description = marker.get("description", "")
+        position = marker.get("position", [0, 0, 0])
+        rotation = marker.get("rotation", [0, 0, 0])
+
+        nav = self._camera_navigation
+        marker_nav_key = f"__marker_{key}"
+        nav.add_position(marker_nav_key, tuple(position), tuple(rotation), label)
+        await nav.navigate_to(marker_nav_key)
+
+        # Wait for camera to settle after navigation
+        await asyncio.sleep(1.0)
+
+        try:
+            # Capture the viewport frame at the marker location
+            carb.log_info(f"[CustomMessageManager] Capturing frame at marker '{key}'...")
+            frame_data = await self._viewport_capture.capture_frame_async(width=1280, height=720)
+
+            if not frame_data:
+                carb.log_warn(f"[CustomMessageManager] Frame capture failed for marker '{key}'")
+                get_eventdispatcher().dispatch_event(
+                    "markerInfoResponse",
+                    payload={"key": key, "label": label, "message": f"Could not capture view at {label}.", "metadata": {}}
+                )
+                return
+
+            # Compress frame: small thumbnail for WebRTC, full-res for vision agent
+            thumbnail_b64, vision_b64 = self._compress_planogram_frame(frame_data)
+            carb.log_info(
+                f"[CustomMessageManager] Marker frame compressed: "
+                f"thumb={len(thumbnail_b64)//1024}KB, vision={len(vision_b64)//1024}KB"
+            )
+
+            # Send captured frame to vision agent for analysis
+            query = f"Describe what you see in this area labeled '{label}'. What products are on the shelves? Any notable details about the display or arrangement?"
+            carb.log_info(f"[CustomMessageManager] Sending frame to vision agent for marker '{key}'...")
+
+            analysis_response = await self._agent_client.send_frame_for_analysis(
+                frame_data=vision_b64,
+                original_query=query,
+                session_id=f"marker_{key}",
+                context={"marker_key": key, "marker_label": label, "marker_description": description},
+            )
+
+            response_metadata = analysis_response.metadata or {}
+            image_url = response_metadata.get("image_url")
+
+            get_eventdispatcher().dispatch_event(
+                "markerInfoResponse",
+                payload={
+                    "key": key,
+                    "label": label,
+                    "message": analysis_response.message,
+                    "metadata": response_metadata,
+                    "captured_frame": thumbnail_b64 if not image_url else None,
+                    "image_url": image_url,
+                }
+            )
+        except Exception as e:
+            carb.log_error(f"[CustomMessageManager] Marker analysis for '{key}' failed: {e}")
+            get_eventdispatcher().dispatch_event(
+                "markerInfoResponse",
+                payload={
+                    "key": key,
+                    "label": label,
+                    "message": f"Information about {label} is currently unavailable.",
+                    "metadata": {},
+                }
+            )
+
+    # ===== END WAYPOINT MARKERS =====
+
+    # ── Camera position broadcast (for playlist/navigation panel) ────────────
+
+    def _on_start_camera_broadcast(self, event: carb.events.IEvent) -> None:
+        if self._camera_broadcast_running:
+            return
+        carb.log_info("[CustomMessageManager] Starting camera position broadcast")
+        self._camera_broadcast_running = True
+        asyncio.ensure_future(self._camera_broadcast_loop())
+
+    def _on_stop_camera_broadcast(self, event: carb.events.IEvent) -> None:
+        carb.log_info("[CustomMessageManager] Stopping camera position broadcast")
+        self._camera_broadcast_running = False
+
+    async def _camera_broadcast_loop(self) -> None:
+        while self._camera_broadcast_running:
+            try:
+                cam_data = self._read_camera_broadcast_data()
+                if cam_data and cam_data != self._last_broadcast_camera:
+                    get_eventdispatcher().dispatch_event(
+                        "cameraPositionUpdate",
+                        payload=cam_data
+                    )
+                    self._last_broadcast_camera = cam_data
+            except Exception as e:
+                carb.log_warn(f"[CustomMessageManager] Camera broadcast error: {e}")
+            await asyncio.sleep(0.1)
+
+    def _read_camera_broadcast_data(self) -> Optional[Dict[str, Any]]:
+        """Read camera view matrix + position + FOV for broadcast."""
+        try:
+            import omni.usd
+            from pxr import UsdGeom
+
+            stage = omni.usd.get_context().get_stage()
+            if not stage:
+                return None
+
+            camera_prim = None
+            try:
+                from omni.kit.viewport.utility import get_active_viewport_camera_path
+                cam_path = get_active_viewport_camera_path()
+                if cam_path:
+                    camera_prim = stage.GetPrimAtPath(cam_path)
+            except Exception:
+                pass
+
+            if not camera_prim or not camera_prim.IsValid():
+                camera_prim = stage.GetPrimAtPath(self._camera_navigation._camera_path)
+
+            if not camera_prim or not camera_prim.IsValid():
+                return None
+
+            xformable = UsdGeom.Xformable(camera_prim)
+            world_xform = xformable.ComputeLocalToWorldTransform(0)
+            view_xform = world_xform.GetInverse()
+
+            view_flat = []
+            for row in range(4):
+                for col in range(4):
+                    view_flat.append(float(view_xform[row][col]))
+
+            t = world_xform.ExtractTranslation()
+
+            fov = 60.0
+            try:
+                cam = UsdGeom.Camera(camera_prim)
+                ha = cam.GetHorizontalApertureAttr().Get()
+                fl = cam.GetFocalLengthAttr().Get()
+                if ha and fl and fl > 0:
+                    fov = math.degrees(2.0 * math.atan(ha / (2.0 * fl)))
+            except Exception:
+                pass
+
+            return {
+                "viewMatrix": view_flat,
+                "position": [float(t[0]), float(t[1]), float(t[2])],
+                "fov": fov,
+            }
+        except Exception as e:
+            carb.log_warn(f"[CustomMessageManager] Camera broadcast read failed: {e}")
+            return None
+
+
     def on_shutdown(self):
         """Clean up when the manager is shut down"""
         carb.log_info("[CustomMessageManager] Shutting down...")
+
+        # Stop camera broadcast
+        self._camera_broadcast_running = False
 
         # Cancel pending requests
         for request_id in list(self._pending_requests.keys()):
