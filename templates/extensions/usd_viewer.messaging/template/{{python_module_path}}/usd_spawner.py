@@ -12,6 +12,7 @@ obtain the 3D world position where the asset will be placed.
 
 import json
 import os
+import random
 import re
 import time
 
@@ -135,6 +136,7 @@ ASSET_LIBRARY: dict[str, str] = {
         # Props (USD-Assets)
         ("wine_bottles",             "Wine_bottles.usdz"),
         ("liquor_bottles",           "Liquor_bottles.usdz"),
+        ("spilled_coffee",           "Spilled_Coffee.usdz"),
     ]},
 }
 
@@ -1534,6 +1536,20 @@ class UsdSpawner:
             self._reply({"result": "error", "error": "Could not compute world position",
                          "prim_path": "", "position": [0, 0, 0]})
             return
+
+        # Spilled_coffee randomizes position on the floor and ensures only one instance exists
+        if prim_name == "spilled_coffee":
+            self._delete_usd(prim_name)
+
+            up_axis = self._detect_up_axis()
+            floor_level = self._get_floor_level(up_axis)
+            rx = random.uniform(-400, 400)
+            rz = random.uniform(-400, 400)
+            if up_axis == "Z":
+                position = Gf.Vec3d(rx, rz, floor_level)
+            else:
+                position = Gf.Vec3d(rx, floor_level, rz)
+            carb.log_info(f"[UsdSpawner] Randomizing spilled_coffee position on floor: {position}")
 
         try:
             prim_path = self._spawn_usd(usd_path, prim_name, position)
