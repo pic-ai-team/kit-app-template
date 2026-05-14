@@ -43,11 +43,11 @@ except Exception as _cfg_err:
     _carb_early.log_warn(f"[UsdSpawner] Could not load usd_config.json: {_cfg_err} — using built-in defaults")
     _cfg = {}
 
-_USD_BASE         = _cfg.get("usd_base",         "/workspace/shashika-ws/github-ws/omniverse-vs-agent-backend/usd")
-_USD_ASSETS       = _cfg.get("usd_assets",       "/workspace/shashika-ws/github-ws/usd-ws/USD-Assets")
-_INVENTORY_FILE   = _cfg.get("inventory_file",   "/workspace/shashika-ws/github-ws/omniverse-vs-agent-backend/asset_list_shop_already.json")
-_STAGE_PRIMS_FILE = _cfg.get("stage_prims_file", "/workspace/shashika-ws/github-ws/omniverse-vs-agent-backend/stage_prims.json")
-_SHELF_ROWS_FILE  = _cfg.get("shelf_rows_file",  "/workspace/shashika-ws/github-ws/omniverse-vs-agent-backend/shelf_rows.json")
+_USD_BASE         = _cfg.get("usd_base",         "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/usd")
+_USD_ASSETS       = _cfg.get("usd_assets",       "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/usd")
+_INVENTORY_FILE   = _cfg.get("inventory_file",   "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/asset_list_shop_already.json")
+_STAGE_PRIMS_FILE = _cfg.get("stage_prims_file", "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/stage_prims.json")
+_SHELF_ROWS_FILE  = _cfg.get("shelf_rows_file",  "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/shelf_rows.json")
 
 ASSET_LIBRARY: dict[str, str] = {
     **{k: f"{_USD_BASE}/{f}" for k, f in [
@@ -563,38 +563,7 @@ class UsdSpawner:
             carb.log_warn(f"[UsdSpawner] Could not write stage_prims.json: {exc}")
 
         # Push the full inventory (with unit_count) directly to the agent backend.
-        # Try several candidate URLs — Docker may map port 8000 to localhost or
-        # a bridge IP depending on run flags.
-        _BACKEND_CANDIDATES = [
-            "http://localhost:8000",
-            "http://127.0.0.1:8000",
-            "http://172.17.0.1:8000",   # default Docker bridge gateway from host
-            "http://172.20.0.1:8000",   # alternate Docker network gateway
-        ]
-        import urllib.request as _ur
-        _payload = json.dumps({"inventory": inventory}).encode("utf-8")
-        _posted = False
-        for _base in _BACKEND_CANDIDATES:
-            try:
-                _req = _ur.Request(
-                    f"{_base}/api/stage-prims-kit",
-                    data=_payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with _ur.urlopen(_req, timeout=3) as _resp:
-                    _body = _resp.read().decode()
-                    carb.log_info(f"[UsdSpawner] Inventory POSTed to backend at {_base}: {_body}")
-                    _posted = True
-                    break
-            except Exception as _exc:
-                carb.log_info(f"[UsdSpawner] Backend not reachable at {_base}: {_exc}")
-        if not _posted:
-            carb.log_warn(
-                "[UsdSpawner] Could not reach agent backend — unit_count data will "
-                "not be available until Kit restarts and backend is reachable. "
-                f"Tried: {_BACKEND_CANDIDATES}"
-            )
+        self._send_to_backend("/api/inventory", "PUT", {"inventory": inventory})
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -992,6 +961,32 @@ class UsdSpawner:
         get_eventdispatcher().dispatch_event("replaceUsdResponse", payload=payload)
 
     # ------------------------------------------------------------------
+    # Backend HTTP helper
+    # ------------------------------------------------------------------
+
+    _BACKEND_URL = _cfg.get("backend_url", "http://localhost:8000").rstrip("/")
+
+    def _send_to_backend(self, path: str, method: str, payload: dict) -> bool:
+        """Send JSON to the agent backend (URL from usd_config.json) using the specified HTTP method."""
+        import urllib.request as _ur
+        url = f"{self._BACKEND_URL}{path}"
+        data = json.dumps(payload).encode("utf-8")
+        method = method.upper().strip()
+        try:
+            req = _ur.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method=method,
+            )
+            with _ur.urlopen(req, timeout=5) as resp:
+                carb.log_info(f"[UsdSpawner] {method} {path} → {self._BACKEND_URL}: {resp.read().decode()}")
+                return True
+        except Exception as exc:
+            carb.log_warn(f"[UsdSpawner] {method} {path} to {self._BACKEND_URL} failed: {exc}")
+        return False
+
+    # ------------------------------------------------------------------
     # Inventory helpers — persistent JSON tracking of spawned prims
     # ------------------------------------------------------------------
 
@@ -1016,7 +1011,7 @@ class UsdSpawner:
 
     def _inventory_add(self, prim_path: str, asset_key: str, usd_path: str,
                        position: "Gf.Vec3d") -> None:
-        """Record a newly spawned prim in the inventory file."""
+        """Record a newly spawned prim in the inventory file and notify backend DB."""
         inv = self._load_inventory()
         inv[prim_path] = {
             "asset_key":  asset_key,
@@ -1029,8 +1024,18 @@ class UsdSpawner:
         self._save_inventory(inv)
         carb.log_info(f"[UsdSpawner] Inventory: added {prim_path}")
 
+        # Notify backend database
+        self._send_to_backend("/api/inventory", "POST", {
+            "prim_path": prim_path,
+            "asset_key": asset_key,
+            "pos_x": round(position[0], 3),
+            "pos_y": round(position[1], 3),
+            "pos_z": round(position[2], 3),
+            "unit_count": 1,
+        })
+
     def _inventory_remove(self, prim_paths) -> None:
-        """Remove one or more prim paths from both inventory files."""
+        """Remove one or more prim paths from both inventory files and notify backend DB."""
         if isinstance(prim_paths, str):
             prim_paths = [prim_paths]
         for inv_path in (INVENTORY_FILE, STAGE_PRIMS_FILE):
@@ -1050,6 +1055,11 @@ class UsdSpawner:
                         json.dump(inv, f, indent=2)
             except Exception as exc:
                 carb.log_warn(f"[UsdSpawner] Could not update {inv_path}: {exc}")
+
+        # Notify backend database
+        self._send_to_backend("/api/inventory", "DELETE", {
+            "prim_paths": list(prim_paths),
+        })
 
     def _inventory_find_by_brand(self, brand_or_key: str) -> list:
         """

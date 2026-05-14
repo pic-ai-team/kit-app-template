@@ -13,6 +13,7 @@ import asyncio
 from .stage_loading import LoadingManager
 from .stage_management import StageManager
 from .custom_messaging import CustomMessageManager  # ADD THIS IMPORT
+from .usd_spawner import _cfg as _usd_cfg
 from .api_server import start_api_server, stop_api_server
 from .cctv_capture import get_cctv_capture
 import omni.ext
@@ -31,7 +32,9 @@ class Extension(omni.ext.IExt):
         # Internal messaging state
         self._loading_manager: LoadingManager = LoadingManager()
         self._stage_manager: StageManager = StageManager()
-        self._custom_manager: CustomMessageManager = CustomMessageManager()  # ADD THIS LINE
+        self._custom_manager: CustomMessageManager = CustomMessageManager(
+            agent_backend_url=_usd_cfg.get("backend_url", "http://localhost:8000"),
+        )
 
         # Start API HTTP server (allows agent backend to capture frames directly)
         asyncio.ensure_future(start_api_server(port=8100))

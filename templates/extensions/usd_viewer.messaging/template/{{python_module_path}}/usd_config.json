@@ -1,10 +1,12 @@
 {
   "_comment": "Edit this file to configure paths for your environment. Do not rename keys.",
 
-  "usd_base":   "/workspace/shashika-ws/github-ws/omniverse-vs-agent-backend/usd",
-  "usd_assets": "/workspace/shashika-ws/github-ws/usd-ws/USD-Assets",
+  "usd_base":   "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/usd",
+  "usd_assets": "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/usd",
 
-  "inventory_file":   "/workspace/shashika-ws/github-ws/omniverse-vs-agent-backend/asset_list_shop_already.json",
-  "stage_prims_file": "/workspace/shashika-ws/github-ws/omniverse-vs-agent-backend/stage_prims.json",
-  "shelf_rows_file":  "/workspace/shashika-ws/github-ws/omniverse-vs-agent-backend/shelf_rows.json"
+  "backend_url": "http://localhost:8000",
+
+  "inventory_file":   "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/asset_list_shop_already.json",
+  "stage_prims_file": "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/stage_prims.json",
+  "shelf_rows_file":  "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/shelf_rows.json"
 }
