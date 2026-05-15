@@ -11,28 +11,178 @@
     "scale_z": 0.1
   },
   "wine_bottles": {
-    "scale_x": 0.1,
-    "scale_y": 0.1,
-    "scale_z": 0.1
+    "scale_x": 0.25,
+    "scale_y": 0.25,
+    "scale_z": 0.25
   },
   "liquor_bottles": {
-    "scale_x": 0.1,
-    "scale_y": 0.1,
-    "scale_z": 0.1
+    "scale_x": 0.15,
+    "scale_y": 0.15,
+    "scale_z": 0.15
   },
   "lipton_milktea": {
+    "scale_x": 50.1,
+    "scale_y": 50.1,
+    "scale_z": 50.1
+  },
+  "cheetos_cheddar_jalapeno": {
+    "scale_x": 0.9,
+    "scale_y": 0.9,
+    "scale_z": 0.9
+  },
+  "cheetos_puffs": {
+    "scale_x": 0.8,
+    "scale_y": 0.8,
+    "scale_z": 0.8
+  },
+  "spilled_coffee": {
+    "scale_x": 0.2,
+    "scale_y": 0.2,
+    "scale_z": 0.2
+  },
+  "trash": {
+    "scale_x": 0.75,
+    "scale_y": 0.75,
+    "scale_z": 0.75
+  },
+  "lipton_iced_tea": {
+    "scale_x": 50.1,
+    "scale_y": 50.1,
+    "scale_z": 50.1
+  },
+  "nittotea_milktea": {
+    "scale_x": 50.1,
+    "scale_y": 50.1,
+    "scale_z": 50.1
+  },
+  "freshdel_coco_tea": {
+    "scale_x": 25.05,
+    "scale_y": 25.05,
+    "scale_z": 25.05
+  },
+  "afternoon_jasmine_tea": {
+    "scale_x": 58.65,
+    "scale_y": 58.65,
+    "scale_z": 58.65
+  },
+  "kuangchuan_black_soymilk": {
+    "scale_x": 25.4,
+    "scale_y": 25.4,
+    "scale_z": 25.4
+  },
+  "fuhang_soymilk": {
+    "scale_x": 25.4,
+    "scale_y": 25.4,
+    "scale_z": 25.4
+  },
+  "uni_brownrice_milk": {
+    "scale_x": 25.4,
+    "scale_y": 25.4,
+    "scale_z": 25.4
+  },
+  "quaker_soymilk_oat": {
+    "scale_x": 25.4,
+    "scale_y": 25.4,
+    "scale_z": 25.4
+  },
+  "agv_milk_oat": {
+    "scale_x": 30.15,
+    "scale_y": 30.15,
+    "scale_z": 30.15
+  },
+  "supersup_sports_drink": {
+    "scale_x": 22.2,
+    "scale_y": 22.2,
+    "scale_z": 22.2
+  },
+  "heysong_fin_drink": {
+    "scale_x": 23.15,
+    "scale_y": 23.15,
+    "scale_z": 23.15
+  },
+  "staycool_charcoal_water": {
+    "scale_x": 23.15,
+    "scale_y": 23.15,
+    "scale_z": 23.15
+  },
+  "ufc_coconut_water": {
+    "scale_x": 19.7,
+    "scale_y": 19.7,
+    "scale_z": 19.7
+  },
+  "pringles_cheese": {
+    "scale_x": 46.0,
+    "scale_y": 46.0,
+    "scale_z": 46.0
+  },
+  "pringles_bbq": {
+    "scale_x": 24.75,
+    "scale_y": 24.75,
+    "scale_z": 24.75
+  },
+  "pringles_pizza": {
+    "scale_x": 23.8,
+    "scale_y": 23.8,
+    "scale_z": 23.8
+  },
+  "cheetos_double_cheese": {
+    "scale_x": 23.8,
+    "scale_y": 23.8,
+    "scale_z": 23.8
+  },
+  "cheetos_flaming_hot": {
     "scale_x": 1.0,
     "scale_y": 1.0,
     "scale_z": 1.0
   },
-  "cheetos_cheddar_jalapeno": {
-    "scale_x": 0.7,
-    "scale_y": 0.7,
-    "scale_z": 0.7
+  "uni_minced_meat_noodle": {
+    "scale_x": 27.3,
+    "scale_y": 27.3,
+    "scale_z": 27.3
   },
-  "cheetos_puffs": {
-    "scale_x": 0.7,
-    "scale_y": 0.7,
-    "scale_z": 0.7
+  "manhan_beef_noodles": {
+    "scale_x": 27.3,
+    "scale_y": 27.3,
+    "scale_z": 27.3
+  },
+  "grab_beef_veg_noodle": {
+    "scale_x": 27.3,
+    "scale_y": 27.3,
+    "scale_z": 27.3
+  },
+  "grab_pork_spinach_noodle": {
+    "scale_x": 27.3,
+    "scale_y": 27.3,
+    "scale_z": 27.3
+  },
+  "ahq_red_pepper_noodle": {
+    "scale_x": 27.3,
+    "scale_y": 27.3,
+    "scale_z": 27.3
+  },
+  "ahq_seafood_noodle": {
+    "scale_x": 27.3,
+    "scale_y": 27.3,
+    "scale_z": 27.3
+  },
+  "double_bang_satay_noodle": {
+    "scale_x": 27.3,
+    "scale_y": 27.3,
+    "scale_z": 27.3
+  },
+  "weili_soybean_noodle": {
+    "scale_x": 75.15,
+    "scale_y": 75.15,
+    "scale_z": 75.15
+  },
+  "yidu_beef_noodle": {
+    "scale_x": 29.5,
+    "scale_y": 29.5,
+    "scale_z": 29.5
+  },
+  "recycle_bin": {
+    "scale_x": 46.0,
+    "scale_y": 46.0,
+    "scale_z": 46.0
   }
 }
