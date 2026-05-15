@@ -8,5 +8,8 @@
 
   "inventory_file":   "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/asset_list_shop_already.json",
   "stage_prims_file": "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/stage_prims.json",
-  "shelf_rows_file":  "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/shelf_rows.json"
+  "shelf_rows_file":  "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/shelf_rows.json",
+
+
+  "incident_spawn_zones": [[-80, -20, -200, 1000], [-620, -510, -180, 1400]] 
 }

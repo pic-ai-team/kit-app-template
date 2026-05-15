@@ -12,6 +12,7 @@ obtain the 3D world position where the asset will be placed.
 
 import json
 import os
+import random
 import re
 import time
 
@@ -49,8 +50,32 @@ _INVENTORY_FILE   = _cfg.get("inventory_file",   "/home/aicenter/adrian/local-om
 _STAGE_PRIMS_FILE = _cfg.get("stage_prims_file", "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/stage_prims.json")
 _SHELF_ROWS_FILE  = _cfg.get("shelf_rows_file",  "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/shelf_rows.json")
 
+# ---------------------------------------------------------------------------
+# Incident spawn zones — rectangles on the ground plane (floor level) where
+# incident objects (trash, spills, fire) can be randomly placed.
+# Each zone is (x_min, x_max, z_min, z_max) for Y-up stages.
+# These should be aisle / open-floor areas, NOT inside shelves.
+# Edit or extend this list to match your store layout.
+# ---------------------------------------------------------------------------
+_INCIDENT_SPAWN_ZONES: list[tuple[float, float, float, float]] = _cfg.get("incident_spawn_zones", 
+[
+    [-80, -20, -200, 1000], # Main aisle
+    [-620, -510, -180, 1400] # Drinks aisle
+])
+
+carb.log_info(f"[UsdSpawner] Using incident spawn zones: {_INCIDENT_SPAWN_ZONES}")
+
+# Incident asset keys — maps incident type name → asset key in ASSET_LIBRARY
+INCIDENT_ASSETS: dict[str, str] = {
+    "trash":  "trash",
+    "spill":  "spilled_coffee",
+}
+
 ASSET_LIBRARY: dict[str, str] = {
     **{k: f"{_USD_BASE}/{f}" for k, f in [
+        # Incidents
+        ("spilled_coffee",           "Spilled_Coffee.usdz"),
+        ("trash",                    "Trash.usdz"),
         # Tea & Milk Tea
         ("lipton_milktea",           "Lipton_Milktea.usdz"),
         ("lipton_iced_tea",          "Lipton_Fruit_Iced_Tea.usdz"),
@@ -311,7 +336,8 @@ class UsdSpawner:
 
         # Register outgoing events
         for evt in ("spawnUsdResponse", "deleteUsdResponse", "replaceUsdResponse", "replaceAllUsdResponse",
-                    "detectShelfRowsResponse", "replaceRowResponse"):
+                    "detectShelfRowsResponse", "replaceRowResponse",
+                    "incidentSpawnResponse", "incidentDeleteAllResponse"):
             messaging.register_event_type_to_send(evt)
             omni.kit.app.register_event_alias(
                 carb.events.type_from_string(evt), evt
@@ -418,6 +444,32 @@ class UsdSpawner:
                 observer_name="UsdSpawner:replaceRowRequest",
                 event_name="replaceRowRequest",
                 on_event=self._on_replace_row_request,
+            )
+        )
+
+        # Subscribe to incident spawn request (random ground-level placement)
+        omni.kit.app.register_event_alias(
+            carb.events.type_from_string("incidentSpawnRequest"),
+            "incidentSpawnRequest",
+        )
+        self._subscriptions.append(
+            get_eventdispatcher().observe_event(
+                observer_name="UsdSpawner:incidentSpawnRequest",
+                event_name="incidentSpawnRequest",
+                on_event=self._on_incident_spawn_request,
+            )
+        )
+
+        # Subscribe to incident delete-all request
+        omni.kit.app.register_event_alias(
+            carb.events.type_from_string("incidentDeleteAllRequest"),
+            "incidentDeleteAllRequest",
+        )
+        self._subscriptions.append(
+            get_eventdispatcher().observe_event(
+                observer_name="UsdSpawner:incidentDeleteAllRequest",
+                event_name="incidentDeleteAllRequest",
+                on_event=self._on_incident_delete_all_request,
             )
         )
 
@@ -1942,6 +1994,129 @@ class UsdSpawner:
 
         _reply(True, f"Replacing row {row_num} ({len(source_paths)} items) with {target_asset_key}",
                count=len(source_paths))
+
+    # ------------------------------------------------------------------
+    # Incident spawner — random ground-level placement in safe zones
+    # ------------------------------------------------------------------
+
+    def _pick_random_ground_position(self) -> "Gf.Vec3d":
+        """Pick a random position within one of the configured spawn zones on the floor plane."""
+        zone = random.choice(_INCIDENT_SPAWN_ZONES)
+        x_min, x_max, z_min, z_max = zone
+        x = random.uniform(x_min, x_max)
+        z = random.uniform(z_min, z_max)
+        up_axis = self._detect_up_axis()
+        floor_level = self._get_floor_level(up_axis)
+        if up_axis == "Z":
+            return Gf.Vec3d(x, z, floor_level)
+        return Gf.Vec3d(x, floor_level, z)
+
+    def _on_incident_spawn_request(self, event) -> None:
+        """
+        incidentSpawnRequest payload:
+          { incident_type: "trash" | "spill" | "random" }
+
+        Spawns the corresponding incident asset at a random ground-level
+        position within the configured spawn zones.
+        """
+        payload = event.payload
+        incident_type = str(payload.get("incident_type", "random"))
+
+        carb.log_info(f"[UsdSpawner] incidentSpawnRequest  type={incident_type}")
+
+        # Resolve incident type → asset key
+        if incident_type == "random":
+            asset_key = random.choice(list(INCIDENT_ASSETS.values()))
+        else:
+            asset_key = INCIDENT_ASSETS.get(incident_type)
+
+        if not asset_key:
+            get_eventdispatcher().dispatch_event("incidentSpawnResponse", payload={
+                "result": "error",
+                "error": f"Unknown incident type: '{incident_type}'. "
+                         f"Valid types: {list(INCIDENT_ASSETS.keys()) + ['random']}",
+                "prim_path": "", "position": [0, 0, 0],
+            })
+            return
+
+        usd_path = ASSET_LIBRARY.get(asset_key)
+        if not usd_path:
+            get_eventdispatcher().dispatch_event("incidentSpawnResponse", payload={
+                "result": "error",
+                "error": f"No USD path for incident asset '{asset_key}'.",
+                "prim_path": "", "position": [0, 0, 0],
+            })
+            return
+
+        position = self._pick_random_ground_position()
+
+        try:
+            prim_path = self._spawn_usd(usd_path, asset_key, position)
+            get_eventdispatcher().dispatch_event("incidentSpawnResponse", payload={
+                "result": "success",
+                "prim_path": prim_path,
+                "incident_type": incident_type,
+                "asset_key": asset_key,
+                "position": [round(position[0], 3), round(position[1], 3),
+                             round(position[2], 3)],
+                "error": "",
+            })
+        except Exception as exc:
+            carb.log_error(f"[UsdSpawner] Incident spawn failed: {exc}")
+            get_eventdispatcher().dispatch_event("incidentSpawnResponse", payload={
+                "result": "error", "error": str(exc),
+                "prim_path": "", "position": [0, 0, 0],
+            })
+
+    def _on_incident_delete_all_request(self, event) -> None:
+        """
+        incidentDeleteAllRequest payload:
+          { incident_type: "trash" | "spill" | "all" }
+
+        Deletes all spawned prims matching the given incident type (or all incident types).
+        """
+        payload = event.payload
+        incident_type = str(payload.get("incident_type", "all"))
+
+        carb.log_info(f"[UsdSpawner] incidentDeleteAllRequest  type={incident_type}")
+
+        # Determine which asset keys to delete
+        if incident_type == "all":
+            keys_to_delete = list(INCIDENT_ASSETS.values())
+        else:
+            key = INCIDENT_ASSETS.get(incident_type)
+            keys_to_delete = [key] if key else []
+
+        if not keys_to_delete:
+            get_eventdispatcher().dispatch_event("incidentDeleteAllResponse", payload={
+                "result": "error",
+                "error": f"Unknown incident type: '{incident_type}'.",
+                "count": 0,
+            })
+            return
+
+        stage = omni.usd.get_context().get_stage()
+        deleted = []
+
+        for asset_key in keys_to_delete:
+            paths = self._find_prims_by_asset_key(asset_key)
+            for prim_path in paths:
+                prim = stage.GetPrimAtPath(prim_path)
+                if prim and prim.IsValid():
+                    stage.RemovePrim(prim_path)
+                    deleted.append(prim_path)
+            # Clear in-memory tracker
+            self._spawned_prims.pop(asset_key, None)
+
+        if deleted:
+            self._inventory_remove(deleted)
+
+        get_eventdispatcher().dispatch_event("incidentDeleteAllResponse", payload={
+            "result": "success" if deleted else "none",
+            "count": len(deleted),
+            "deleted_paths": deleted,
+        })
+        carb.log_info(f"[UsdSpawner] Incident delete-all: removed {len(deleted)} prims")
 
     # ------------------------------------------------------------------
 
