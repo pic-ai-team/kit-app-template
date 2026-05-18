@@ -919,7 +919,7 @@ class CustomMessageManager:
     def _compress_planogram_frame(frame_b64: str):
         """
         Return (thumbnail_b64, vision_b64).
-        thumbnail  ~15 KB (400 px wide, q65) — safe for WebRTC data channel
+        thumbnail  ~15 KB (250 px wide, q50) — safe for WebRTC data channel
         vision     full-res q90 JPEG         — sent server-side only
         """
         import base64 as _b64
@@ -933,10 +933,10 @@ class CustomMessageManager:
             img.save(vis_buf, format="JPEG", quality=90)
             vision_b64 = _b64.b64encode(vis_buf.getvalue()).decode("utf-8")
 
-            ratio = 400 / img.width if img.width > 400 else 1.0
+            ratio = 250 / img.width if img.width > 250 else 1.0
             thumb = img.resize((int(img.width * ratio), int(img.height * ratio)), _Image.LANCZOS)
             th_buf = _io.BytesIO()
-            thumb.save(th_buf, format="JPEG", quality=65)
+            thumb.save(th_buf, format="JPEG", quality=50)
             thumbnail_b64 = _b64.b64encode(th_buf.getvalue()).decode("utf-8")
 
             return thumbnail_b64, vision_b64
