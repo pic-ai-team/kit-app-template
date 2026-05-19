@@ -17,6 +17,7 @@ from .viewport_capture import ViewportCapture
 from .agent_client import AgentClient, AgentAction, ChatRequest, AgentResponse
 from .camera_navigation import get_camera_navigation, CameraNavigation
 from .usd_spawner import UsdSpawner
+from .fire_incident_manager import FireIncidentManager
 
 
 class CustomMessageManager:
@@ -40,6 +41,18 @@ class CustomMessageManager:
         # Camera navigation for moving to store locations
         self._camera_navigation: CameraNavigation = get_camera_navigation()
 
+        # Waypoint markers
+        self._markers: Dict[str, Dict[str, Any]] = {}
+        self._markers_file = self._resolve_markers_file()
+        self._load_markers()
+
+        # Fire incident simulation (must be created after _markers is populated)
+        self._fire_manager = FireIncidentManager(self._markers)
+
+        # Camera broadcast state
+        self._camera_broadcast_running = False
+        self._last_broadcast_camera: Optional[Dict[str, Any]] = None
+
         carb.log_info("[CustomMessageManager] Initializing...")
 
         # ===== REGISTER OUTGOING MESSAGES (Kit -> Web Client) =====
@@ -60,6 +73,15 @@ class CustomMessageManager:
             "navPositionsResponse",      # Full positions list (after any CRUD operation)
             "cameraPositionResponse",    # Current camera position query result
             "navRoutesResponse",         # Waypoint routes list
+            # Waypoint markers
+            "markersResponse",           # Full marker list
+            "markerInfoResponse",        # AI-generated info for a clicked marker
+            "cameraPositionUpdate",      # Periodic camera transform broadcast for 3D projection
+            # Fire incident simulation
+            "fireAlert",                 # Broadcast when a fire incident is triggered
+            "fireCleared",               # Broadcast when a fire incident is extinguished
+            "fireIncidentResponse",      # Direct reply to fireIncidentRequest
+            "fireAdjustResponse",        # Reply to fireAdjustRequest
         ]
 
         for message_type in outgoing_messages:
@@ -98,6 +120,16 @@ class CustomMessageManager:
             'saveNavRoute':        self._on_save_nav_route,
             'deleteNavRoute':      self._on_delete_nav_route,
             'getNavRoutes':        self._on_get_nav_routes,
+            # Waypoint markers
+            'getMarkers':          self._on_get_markers,
+            'createMarker':        self._on_create_marker,
+            'deleteMarker':        self._on_delete_marker,
+            'clickMarker':         self._on_click_marker,
+            'startCameraBroadcast': self._on_start_camera_broadcast,
+            'stopCameraBroadcast':  self._on_stop_camera_broadcast,
+            # Fire incident simulation
+            'fireIncidentRequest':  self._on_fire_incident_request,
+            'fireAdjustRequest':    self._on_fire_adjust_request,
         }
 
         ed = get_eventdispatcher()
@@ -1425,9 +1457,406 @@ class CustomMessageManager:
 
     # ===== END CAMERA NAV POSITION REGISTRY =====
 
+    # ===== WAYPOINT MARKERS =====
+
+    def _resolve_markers_file(self) -> str:
+        import os
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "markers.json")
+
+    def _load_markers(self) -> None:
+        import json as _json
+        import os
+        try:
+            if os.path.exists(self._markers_file):
+                with open(self._markers_file, "r") as f:
+                    self._markers = _json.load(f)
+                carb.log_info(f"[CustomMessageManager] Loaded {len(self._markers)} markers")
+            else:
+                self._markers = {}
+                carb.log_info("[CustomMessageManager] No markers.json found, starting empty")
+        except Exception as e:
+            carb.log_warn(f"[CustomMessageManager] Failed to load markers: {e}")
+            self._markers = {}
+
+    def _save_markers(self) -> None:
+        import json as _json
+        try:
+            with open(self._markers_file, "w") as f:
+                _json.dump(self._markers, f, indent=2)
+            carb.log_info(f"[CustomMessageManager] Saved {len(self._markers)} markers")
+        except Exception as e:
+            carb.log_error(f"[CustomMessageManager] Failed to save markers: {e}")
+
+    def _dispatch_markers(self) -> None:
+        markers_list = []
+        for key, data in self._markers.items():
+            markers_list.append({
+                "key": key,
+                "label": data.get("label", key),
+                "description": data.get("description", ""),
+                "position": data.get("position", [0, 0, 0]),
+                "rotation": data.get("rotation", [0, 0, 0]),
+            })
+        get_eventdispatcher().dispatch_event(
+            "markersResponse",
+            payload={"markers": markers_list}
+        )
+
+    def _on_get_markers(self, event: carb.events.IEvent) -> None:
+        carb.log_info("[CustomMessageManager] getMarkers received")
+        self._dispatch_markers()
+
+    def _on_create_marker(self, event: carb.events.IEvent) -> None:
+        payload = event.payload
+        name = payload.get("name", "").strip()
+        description = payload.get("description", name)
+
+        if not name:
+            carb.log_warn("[CustomMessageManager] createMarker: empty name ignored")
+            return
+
+        pos = self._read_camera_position_robust()
+        if not pos:
+            carb.log_warn("[CustomMessageManager] createMarker: could not read camera position")
+            return
+
+        key = name.lower().replace(" ", "_")
+        self._markers[key] = {
+            "label": name,
+            "description": description,
+            "position": pos["location"],
+            "rotation": pos["rotation"],
+        }
+        self._save_markers()
+        carb.log_info(f"[CustomMessageManager] Created marker '{key}' at {pos['location']}")
+        self._dispatch_markers()
+
+    def _on_delete_marker(self, event: carb.events.IEvent) -> None:
+        key = event.payload.get("key", "").strip()
+        if key in self._markers:
+            del self._markers[key]
+            self._save_markers()
+            carb.log_info(f"[CustomMessageManager] Deleted marker '{key}'")
+        else:
+            carb.log_warn(f"[CustomMessageManager] deleteMarker: key '{key}' not found")
+        self._dispatch_markers()
+
+    def _on_click_marker(self, event: carb.events.IEvent) -> None:
+        key = event.payload.get("key", "").strip()
+        if key not in self._markers:
+            carb.log_warn(f"[CustomMessageManager] clickMarker: key '{key}' not found")
+            return
+
+        marker = self._markers[key]
+        carb.log_info(f"[CustomMessageManager] clickMarker '{key}' — navigating + querying agent")
+        asyncio.ensure_future(self._do_click_marker(key, marker))
+
+    async def _do_click_marker(self, key: str, marker: Dict[str, Any]) -> None:
+        label = marker.get("label", key)
+        description = marker.get("description", "")
+        position = marker.get("position", [0, 0, 0])
+        rotation = marker.get("rotation", [0, 0, 0])
+
+        nav = self._camera_navigation
+        marker_nav_key = f"__marker_{key}"
+        nav.add_position(marker_nav_key, tuple(position), tuple(rotation), label)
+        await nav.navigate_to(marker_nav_key)
+
+        # Wait for camera to settle after navigation
+        await asyncio.sleep(1.0)
+
+        try:
+            # Capture the viewport frame at the marker location
+            carb.log_info(f"[CustomMessageManager] Capturing frame at marker '{key}'...")
+            frame_data = await self._viewport_capture.capture_frame_async(width=1280, height=720)
+
+            if not frame_data:
+                carb.log_warn(f"[CustomMessageManager] Frame capture failed for marker '{key}'")
+                get_eventdispatcher().dispatch_event(
+                    "markerInfoResponse",
+                    payload={"key": key, "label": label, "message": f"Could not capture view at {label}.", "metadata": {}}
+                )
+                return
+
+            # Compress frame: small thumbnail for WebRTC, full-res for vision agent
+            thumbnail_b64, vision_b64 = self._compress_planogram_frame(frame_data)
+            carb.log_info(
+                f"[CustomMessageManager] Marker frame compressed: "
+                f"thumb={len(thumbnail_b64)//1024}KB, vision={len(vision_b64)//1024}KB"
+            )
+
+            # Send captured frame to vision agent for analysis
+            query = f"Describe what you see in this area labeled '{label}'. What products are on the shelves? Any notable details about the display or arrangement?"
+            carb.log_info(f"[CustomMessageManager] Sending frame to vision agent for marker '{key}'...")
+
+            analysis_response = await self._agent_client.send_frame_for_analysis(
+                frame_data=vision_b64,
+                original_query=query,
+                session_id=f"marker_{key}",
+                context={"marker_key": key, "marker_label": label, "marker_description": description},
+            )
+
+            response_metadata = analysis_response.metadata or {}
+            image_url = response_metadata.get("image_url")
+
+            get_eventdispatcher().dispatch_event(
+                "markerInfoResponse",
+                payload={
+                    "key": key,
+                    "label": label,
+                    "message": analysis_response.message,
+                    "metadata": response_metadata,
+                    "captured_frame": thumbnail_b64 if not image_url else None,
+                    "image_url": image_url,
+                }
+            )
+        except Exception as e:
+            carb.log_error(f"[CustomMessageManager] Marker analysis for '{key}' failed: {e}")
+            get_eventdispatcher().dispatch_event(
+                "markerInfoResponse",
+                payload={
+                    "key": key,
+                    "label": label,
+                    "message": f"Information about {label} is currently unavailable.",
+                    "metadata": {},
+                }
+            )
+
+    # ── Camera position broadcast for 3D projection ─────────────────────────
+
+    def _on_start_camera_broadcast(self, event: carb.events.IEvent) -> None:
+        if self._camera_broadcast_running:
+            return
+        carb.log_info("[CustomMessageManager] Starting camera position broadcast")
+        self._camera_broadcast_running = True
+        asyncio.ensure_future(self._camera_broadcast_loop())
+
+    def _on_stop_camera_broadcast(self, event: carb.events.IEvent) -> None:
+        carb.log_info("[CustomMessageManager] Stopping camera position broadcast")
+        self._camera_broadcast_running = False
+
+    async def _camera_broadcast_loop(self) -> None:
+        while self._camera_broadcast_running:
+            try:
+                cam_data = self._read_camera_view_matrix()
+                if cam_data:
+                    if cam_data != self._last_broadcast_camera:
+                        get_eventdispatcher().dispatch_event(
+                            "cameraPositionUpdate",
+                            payload=cam_data
+                        )
+                        self._last_broadcast_camera = cam_data
+            except Exception as e:
+                carb.log_warn(f"[CustomMessageManager] Camera broadcast error: {e}")
+            await asyncio.sleep(0.1)
+
+    def _read_camera_view_matrix(self) -> Optional[Dict[str, Any]]:
+        try:
+            import omni.usd
+            from pxr import UsdGeom
+
+            stage = omni.usd.get_context().get_stage()
+            if not stage:
+                return None
+
+            camera_prim = None
+            try:
+                from omni.kit.viewport.utility import get_active_viewport_camera_path
+                cam_path = get_active_viewport_camera_path()
+                if cam_path:
+                    camera_prim = stage.GetPrimAtPath(cam_path)
+            except Exception:
+                pass
+
+            if not camera_prim or not camera_prim.IsValid():
+                camera_prim = stage.GetPrimAtPath(self._camera_navigation._camera_path)
+
+            if not camera_prim or not camera_prim.IsValid():
+                return None
+
+            xformable = UsdGeom.Xformable(camera_prim)
+            world_xform = xformable.ComputeLocalToWorldTransform(0)
+            view_xform = world_xform.GetInverse()
+
+            # Flatten 4x4 matrix to 16-element array (row-major)
+            view_flat = []
+            for row in range(4):
+                for col in range(4):
+                    view_flat.append(float(view_xform[row][col]))
+
+            t = world_xform.ExtractTranslation()
+            fov = self._read_camera_fov()
+
+            return {
+                "viewMatrix": view_flat,
+                "position": [float(t[0]), float(t[1]), float(t[2])],
+                "fov": fov,
+            }
+        except Exception as e:
+            carb.log_warn(f"[CustomMessageManager] _read_camera_view_matrix failed: {e}")
+            return None
+
+    def _read_camera_fov(self) -> float:
+        try:
+            import omni.usd
+            from pxr import UsdGeom
+
+            stage = omni.usd.get_context().get_stage()
+            if not stage:
+                return 60.0
+
+            camera_prim = None
+            try:
+                from omni.kit.viewport.utility import get_active_viewport_camera_path
+                cam_path = get_active_viewport_camera_path()
+                if cam_path:
+                    camera_prim = stage.GetPrimAtPath(cam_path)
+            except Exception:
+                pass
+
+            if not camera_prim or not camera_prim.IsValid():
+                camera_prim = stage.GetPrimAtPath(self._camera_navigation._camera_path)
+
+            if not camera_prim or not camera_prim.IsValid():
+                return 60.0
+
+            cam = UsdGeom.Camera(camera_prim)
+            ha = cam.GetHorizontalApertureAttr().Get()
+            fl = cam.GetFocalLengthAttr().Get()
+            if ha and fl and fl > 0:
+                return math.degrees(2.0 * math.atan(ha / (2.0 * fl)))
+            return 60.0
+        except Exception:
+            return 60.0
+
+    # ===== END WAYPOINT MARKERS =====
+
+    # =========================================================================
+    # FIRE INCIDENT SIMULATION
+    # =========================================================================
+
+    def _on_fire_incident_request(self, event: carb.events.IEvent) -> None:
+        """Handle fireIncidentRequest from the browser.
+
+        Expected payload:
+          action      : "trigger" | "extinguish" | "list"
+          incident_id : str  (required for trigger/extinguish)
+          location_id : str  (optional for trigger — resolves via waypoint markers)
+          position    : { x, y, z }  (optional for trigger — raw world position)
+          screen_x    : float  (optional 0-1 — browser click, resolved via camera ray cast)
+          screen_y    : float  (optional 0-1 — browser click, resolved via camera ray cast)
+          severity    : str  (optional, default "high")
+        """
+        payload = event.payload or {}
+        action      = payload.get("action", "").strip()
+        incident_id = payload.get("incident_id", "").strip()
+        location_id = payload.get("location_id", "").strip()
+        severity    = payload.get("severity", "high")
+
+        def _reply(result: str, message: str, extra: dict = None):
+            response = {"result": result, "incident_id": incident_id, "message": message}
+            if extra:
+                response.update(extra)
+            get_eventdispatcher().dispatch_event("fireIncidentResponse", payload=response)
+
+        if action == "trigger":
+            if not incident_id:
+                _reply("error", "incident_id is required")
+                return
+
+            # Resolve position — priority: waypoint marker → raw xyz → screen click ray cast
+            position = self._fire_manager.resolve_position(location_id) if location_id else None
+            if position is None:
+                raw = payload.get("position", {})
+                if raw:
+                    from pxr import Gf as _Gf
+                    position = _Gf.Vec3d(
+                        float(raw.get("x", 0.0)),
+                        float(raw.get("y", 0.0)),
+                        float(raw.get("z", 0.0)),
+                    )
+                elif "screen_x" in payload and "screen_y" in payload:
+                    position = self._usd_spawner._compute_world_position(
+                        float(payload["screen_x"]),
+                        float(payload["screen_y"]),
+                    )
+                    if position is None:
+                        _reply("error", "Could not convert screen coordinates to world position")
+                        return
+                else:
+                    _reply("error", f"No position: location_id '{location_id}' not found and no raw position or screen_x/y given")
+                    return
+
+            ok, msg = self._fire_manager.trigger_fire(incident_id, position, location_id, severity)
+            if ok:
+                pos_list = self._fire_manager.list_active()[incident_id]["position"]
+                _reply("ok", msg, {"position": {"x": pos_list[0], "y": pos_list[1], "z": pos_list[2]}})
+            else:
+                _reply("error", msg)
+
+        elif action == "extinguish":
+            if not incident_id:
+                _reply("error", "incident_id is required")
+                return
+            ok, msg = self._fire_manager.extinguish_fire(incident_id)
+            _reply("ok" if ok else "error", msg)
+
+        elif action == "list":
+            active = self._fire_manager.list_active()
+            get_eventdispatcher().dispatch_event(
+                "fireIncidentResponse",
+                payload={"result": "ok", "action": "list", "incidents": active},
+            )
+
+        else:
+            _reply("error", f"Unknown action '{action}'. Use trigger|extinguish|list")
+
+    def _on_fire_adjust_request(self, event: carb.events.IEvent) -> None:
+        """Adjust live flame parameters for an existing fire incident.
+
+        Expected payload:
+          incident_id  : str
+          radius       : float  (optional)
+          temperature  : float  (optional)
+          fuel         : float  (optional)
+          smoke        : float  (optional)
+          velocity_up  : float  (optional)
+        """
+        payload = event.payload or {}
+        incident_id = payload.get("incident_id", "").strip()
+
+        def _reply(result: str, message: str):
+            get_eventdispatcher().dispatch_event(
+                "fireAdjustResponse",
+                payload={"result": result, "incident_id": incident_id, "message": message},
+            )
+
+        if not incident_id:
+            _reply("error", "incident_id is required")
+            return
+
+        def _opt(key: str):
+            v = payload.get(key)
+            return float(v) if v is not None else None
+
+        ok, msg = self._fire_manager.adjust_fire(
+            incident_id,
+            radius=_opt("radius"),
+            temperature=_opt("temperature"),
+            fuel=_opt("fuel"),
+            smoke=_opt("smoke"),
+            velocity_up=_opt("velocity_up"),
+        )
+        _reply("ok" if ok else "error", msg)
+
+    # ===== END FIRE INCIDENT SIMULATION =====
+
     def on_shutdown(self):
         """Clean up when the manager is shut down"""
         carb.log_info("[CustomMessageManager] Shutting down...")
+
+        # Stop camera broadcast
+        self._camera_broadcast_running = False
 
         # Cancel pending requests
         for request_id in list(self._pending_requests.keys()):
@@ -1441,6 +1870,11 @@ class CustomMessageManager:
         if self._usd_spawner:
             self._usd_spawner.on_shutdown()
             self._usd_spawner = None
+
+        # Extinguish any active fire incidents and remove Flow prims
+        if self._fire_manager:
+            self._fire_manager.on_shutdown()
+            self._fire_manager = None
 
         # Clean up subscriptions
         for sub in self._subscriptions:
