@@ -55,6 +55,8 @@ class CustomMessageManager:
         # 3D waypoint selection state
         self._selection_sub = None
         self._markers_only_selection = False
+        # Pending marker placement: filled when browser is waiting for user to click a surface
+        self._pending_marker: Optional[Dict[str, Any]] = None
 
         # Camera broadcast state
         self._camera_broadcast_running = False
@@ -133,6 +135,8 @@ class CustomMessageManager:
             'deleteMarker':            self._on_delete_marker,
             'clickMarker':             self._on_click_marker,
             'setMarkersOnlySelection': self._on_set_markers_only_selection,
+            'startMarkerPlacement':    self._on_start_marker_placement,
+            'cancelMarkerPlacement':   self._on_cancel_marker_placement,
             'startCameraBroadcast':    self._on_start_camera_broadcast,
             'stopCameraBroadcast':     self._on_stop_camera_broadcast,
             # Fire incident simulation
@@ -1796,6 +1800,43 @@ class CustomMessageManager:
                     selection.clear_selected_prim_paths()
                     return
 
+            # ── Placement mode: use the clicked prim's world position ──────
+            if self._pending_marker is not None:
+                # Find any valid prim that was clicked (skip waypoint prims themselves)
+                for path in paths:
+                    prim = stage.GetPrimAtPath(path)
+                    if not prim or not prim.IsValid():
+                        continue
+                    # Skip if user accidentally clicked an existing waypoint
+                    if path.startswith(self.WAYPOINTS_ROOT + "/"):
+                        continue
+                    position = self._prim_world_position(prim)
+                    if position is None:
+                        continue
+                    # Create the marker at the clicked surface position
+                    pending = self._pending_marker
+                    self._pending_marker = None
+                    key = pending["name"].lower().replace(" ", "_")
+                    camera_pos = self._read_camera_position_robust()
+                    self._markers[key] = {
+                        "label":           pending["name"],
+                        "description":     pending["description"],
+                        "position":        list(position),
+                        "rotation":        camera_pos["rotation"] if camera_pos else [0, 0, 0],
+                        "camera_position": camera_pos["location"] if camera_pos else list(position),
+                        "type":            pending["type"],
+                        "image_url":       pending.get("image_url", ""),
+                    }
+                    self._save_markers()
+                    self._create_marker_prim(key, pending["name"], list(position), pending["type"])
+                    selection.clear_selected_prim_paths()
+                    carb.log_info(f"[CustomMessageManager] Placed marker '{key}' at {list(position)} via prim click")
+                    self._dispatch_markers()
+                    return
+                # Clicked on nothing useful — stay in placement mode
+                return
+
+            # ── Normal mode: detect clicks on existing waypoint prims ───────
             for path in paths:
                 if not path.startswith(self.WAYPOINTS_ROOT + "/"):
                     continue
@@ -1818,6 +1859,42 @@ class CustomMessageManager:
     def _on_set_markers_only_selection(self, event: carb.events.IEvent) -> None:
         self._markers_only_selection = bool(event.payload.get("enabled", False))
         carb.log_info(f"[CustomMessageManager] markers-only selection: {self._markers_only_selection}")
+
+    def _on_start_marker_placement(self, event: carb.events.IEvent) -> None:
+        """Browser has entered click-to-place mode. Store the pending marker metadata."""
+        payload = event.payload or {}
+        self._pending_marker = {
+            "name":        payload.get("name", "").strip(),
+            "description": payload.get("description", ""),
+            "type":        payload.get("type", "navigation"),
+            "image_url":   payload.get("image_url", ""),
+        }
+        carb.log_info(f"[CustomMessageManager] Marker placement started: {self._pending_marker['name']} ({self._pending_marker['type']})")
+
+    def _on_cancel_marker_placement(self, event: carb.events.IEvent) -> None:
+        """Browser cancelled the click-to-place flow."""
+        self._pending_marker = None
+        carb.log_info("[CustomMessageManager] Marker placement cancelled")
+
+    @staticmethod
+    def _prim_world_position(prim) -> Optional[list]:
+        """Return the world-space centroid of a prim's bounding box, or its translation."""
+        from pxr import UsdGeom, Usd
+        try:
+            imageable = UsdGeom.Imageable(prim)
+            if imageable:
+                bounds = imageable.ComputeWorldBound(Usd.TimeCode.Default(), UsdGeom.Tokens.default_)
+                if not bounds.GetRange().IsEmpty():
+                    c = bounds.ComputeCentroid()
+                    return [c[0], c[1], c[2]]
+        except Exception:
+            pass
+        try:
+            xform = UsdGeom.Xformable(prim)
+            t = xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).ExtractTranslation()
+            return [t[0], t[1], t[2]]
+        except Exception:
+            return None
 
     # ── Camera position broadcast for 3D projection ─────────────────────────
 
