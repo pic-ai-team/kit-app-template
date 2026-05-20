@@ -1769,8 +1769,18 @@ class CustomMessageManager:
             carb.log_warn(f"[CustomMessageManager] Could not setup selection listener: {e}")
 
     def _on_stage_selection_changed(self, event) -> None:
-        """Handle SELECTION_CHANGED — detect clicks on waypoint marker prims."""
+        """Handle stage events — sync markers on load, detect prim clicks on selection."""
         import omni.usd
+
+        # Re-create 3D prims whenever a new stage finishes loading
+        if event.type in (
+            int(omni.usd.StageEventType.OPENED),
+            int(omni.usd.StageEventType.ASSETS_LOADED),
+        ):
+            carb.log_info("[CustomMessageManager] Stage loaded — syncing markers to stage")
+            self._sync_markers_to_stage()
+            return
+
         if event.type != int(omni.usd.StageEventType.SELECTION_CHANGED):
             return
         try:
