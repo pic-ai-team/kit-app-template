@@ -1789,6 +1789,7 @@ class CustomMessageManager:
             return
         try:
             usd_context = omni.usd.get_context()
+            stage = usd_context.get_stage()
             selection = usd_context.get_selection()
             paths = selection.get_selected_prim_paths()
             if not paths:
