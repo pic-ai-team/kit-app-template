@@ -143,8 +143,9 @@ class CustomMessageManager:
             # Fire incident simulation
             'fireIncidentRequest':  self._on_fire_incident_request,
             'fireAdjustRequest':    self._on_fire_adjust_request,
-            # Joystick camera speed
+            # Joystick
             'setCameraSpeed':       self._on_set_camera_speed,
+            'joystickMove':         self._on_joystick_move,
         }
 
         ed = get_eventdispatcher()
@@ -1932,6 +1933,52 @@ class CustomMessageManager:
             carb.log_info(f"[CustomMessageManager] Camera speed set to level {speed_level} ({speed_val})")
         except Exception as exc:
             carb.log_warn(f"[CustomMessageManager] setCameraSpeed failed: {exc}")
+
+    def _on_joystick_move(self, event: carb.events.IEvent) -> None:
+        """Move camera in the horizontal plane from browser joystick.
+        dx/dy are normalized joystick offsets [-1, 1].
+        dy < 0 = forward; dx > 0 = strafe right. Y is kept constant.
+        """
+        payload = getattr(event, "payload", {}) or {}
+        dx = float(payload.get("dx", 0.0))
+        dy = float(payload.get("dy", 0.0))
+        velocity = int(payload.get("velocity", 3))
+        if abs(dx) < 0.05 and abs(dy) < 0.05:
+            return
+
+        speed_map = {1: 2.0, 2: 5.0, 3: 10.0, 4: 20.0, 5: 35.0}
+        speed = speed_map.get(velocity, 10.0)
+
+        try:
+            from pxr import UsdGeom, Gf, Usd
+
+            result = self._camera_navigation._get_camera_and_ops()
+            if result is None:
+                return
+            xformable, translate_op, _ = result
+            if translate_op is None:
+                return
+
+            world_xform = xformable.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+
+            look_w = world_xform.TransformDir(Gf.Vec3d(0, 0, -1))
+            fwd = Gf.Vec3d(look_w[0], 0.0, look_w[2])
+            if fwd.GetLength() < 1e-6:
+                return
+            fwd = fwd.GetNormalized()
+
+            right_w = world_xform.TransformDir(Gf.Vec3d(1, 0, 0))
+            right = Gf.Vec3d(right_w[0], 0.0, right_w[2])
+            if right.GetLength() < 1e-6:
+                return
+            right = right.GetNormalized()
+
+            cur = translate_op.Get()
+            delta = fwd * (-dy * speed) + right * (dx * speed)
+            translate_op.Set(Gf.Vec3d(cur[0] + delta[0], cur[1], cur[2] + delta[2]))
+
+        except Exception as exc:
+            carb.log_warn(f"[CustomMessageManager] joystickMove error: {exc}")
 
     async def _camera_broadcast_loop(self) -> None:
         while self._camera_broadcast_running:
