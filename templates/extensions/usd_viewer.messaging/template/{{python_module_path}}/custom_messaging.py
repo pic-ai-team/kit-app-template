@@ -17,6 +17,7 @@ from .viewport_capture import ViewportCapture
 from .agent_client import AgentClient, AgentAction, ChatRequest, AgentResponse
 from .camera_navigation import get_camera_navigation, CameraNavigation
 from .usd_spawner import UsdSpawner
+from .fire_incident_manager import FireIncidentManager
 
 
 class CustomMessageManager:
@@ -32,6 +33,7 @@ class CustomMessageManager:
         self._viewport_capture = ViewportCapture()
         self._agent_client = AgentClient(base_url=agent_backend_url)
         self._usd_spawner = UsdSpawner()
+        self._fire_manager = FireIncidentManager()
         self._pending_requests: Dict[str, Dict[str, Any]] = {}  # Track pending chat requests
 
         # Camera position tracking (per session)
@@ -60,6 +62,11 @@ class CustomMessageManager:
             "navPositionsResponse",      # Full positions list (after any CRUD operation)
             "cameraPositionResponse",    # Current camera position query result
             "navRoutesResponse",         # Waypoint routes list
+            # Fire incident simulation
+            "fireAlert",                 # Broadcast when a fire incident is triggered
+            "fireCleared",               # Broadcast when a fire incident is extinguished
+            "fireIncidentResponse",      # Direct reply to fireIncidentRequest
+            "fireAdjustResponse",        # Reply to fireAdjustRequest
         ]
 
         for message_type in outgoing_messages:
@@ -98,6 +105,9 @@ class CustomMessageManager:
             'saveNavRoute':        self._on_save_nav_route,
             'deleteNavRoute':      self._on_delete_nav_route,
             'getNavRoutes':        self._on_get_nav_routes,
+            # Fire incident simulation
+            'fireIncidentRequest':  self._on_fire_incident_request,
+            'fireAdjustRequest':    self._on_fire_adjust_request,
         }
 
         ed = get_eventdispatcher()
@@ -1651,6 +1661,132 @@ class CustomMessageManager:
 
     # ===== END CAMERA NAV POSITION REGISTRY =====
 
+    # =========================================================================
+    # FIRE INCIDENT SIMULATION
+    # =========================================================================
+
+    def _on_fire_incident_request(self, event: carb.events.IEvent) -> None:
+        """Handle fireIncidentRequest from the browser.
+
+        Expected payload:
+          action      : "trigger" | "extinguish" | "list"
+          incident_id : str  (required for trigger/extinguish)
+          position    : { x, y, z }  (optional for trigger — raw world position)
+          screen_x    : float  (optional 0-1 — browser click, resolved via camera ray cast)
+          screen_y    : float  (optional 0-1 — browser click, resolved via camera ray cast)
+          severity    : str  (optional, default "high")
+        """
+        payload = event.payload or {}
+        action      = payload.get("action", "").strip()
+        incident_id = payload.get("incident_id", "").strip()
+        severity    = payload.get("severity", "high")
+
+        def _reply(result: str, message: str, extra: dict = None):
+            response = {"result": result, "incident_id": incident_id, "message": message}
+            if extra:
+                response.update(extra)
+            get_eventdispatcher().dispatch_event("fireIncidentResponse", payload=response)
+
+        if action == "trigger":
+            if not incident_id:
+                _reply("error", "incident_id is required")
+                return
+
+            # Resolve position — priority: raw xyz → screen click ray cast
+            position = None
+            raw = payload.get("position", {})
+            if raw:
+                from pxr import Gf as _Gf
+                position = _Gf.Vec3d(
+                    float(raw.get("x", 0.0)),
+                    float(raw.get("y", 0.0)),
+                    float(raw.get("z", 0.0)),
+                )
+            elif "screen_x" in payload and "screen_y" in payload:
+                position = self._usd_spawner._compute_world_position(
+                    float(payload["screen_x"]),
+                    float(payload["screen_y"]),
+                )
+                if position is None:
+                    _reply("error", "Could not convert screen coordinates to world position")
+                    return
+            else:
+                # Fallback: use a random ground position from the spawner
+                position = self._usd_spawner._pick_random_ground_position()
+
+            ok, msg = self._fire_manager.trigger_fire(
+                incident_id, position, severity,
+                fire_params=dict(payload.get("fire_params", {})) or None,
+            )
+            if ok:
+                pos_list = self._fire_manager.list_active()[incident_id]["position"]
+                _reply("ok", msg, {"position": {"x": pos_list[0], "y": pos_list[1], "z": pos_list[2]}})
+            else:
+                _reply("error", msg)
+
+        elif action == "extinguish":
+            if not incident_id:
+                _reply("error", "incident_id is required")
+                return
+            ok, msg = self._fire_manager.extinguish_fire(incident_id)
+            _reply("ok" if ok else "error", msg)
+
+        elif action == "extinguish_all":
+            ok, msg = self._fire_manager.extinguish_all()
+            get_eventdispatcher().dispatch_event(
+                "fireIncidentResponse",
+                payload={"result": "ok" if ok else "error", "action": "extinguish_all", "message": msg},
+            )
+
+        elif action == "list":
+            active = self._fire_manager.list_active()
+            get_eventdispatcher().dispatch_event(
+                "fireIncidentResponse",
+                payload={"result": "ok", "action": "list", "incidents": active},
+            )
+        else:
+            _reply("error", f"Unknown action '{action}'. Use trigger|extinguish|list")
+
+    def _on_fire_adjust_request(self, event: carb.events.IEvent) -> None:
+        """Adjust live flame parameters for an existing fire incident.
+
+        Expected payload:
+          incident_id  : str
+          radius       : float  (optional)
+          temperature  : float  (optional)
+          fuel         : float  (optional)
+          smoke        : float  (optional)
+          velocity_up  : float  (optional)
+        """
+        payload = event.payload or {}
+        incident_id = payload.get("incident_id", "").strip()
+
+        def _reply(result: str, message: str):
+            get_eventdispatcher().dispatch_event(
+                "fireAdjustResponse",
+                payload={"result": result, "incident_id": incident_id, "message": message},
+            )
+
+        if not incident_id:
+            _reply("error", "incident_id is required")
+            return
+
+        def _opt(key: str):
+            v = payload.get(key)
+            return float(v) if v is not None else None
+
+        ok, msg = self._fire_manager.adjust_fire(
+            incident_id,
+            radius=_opt("radius"),
+            temperature=_opt("temperature"),
+            fuel=_opt("fuel"),
+            smoke=_opt("smoke"),
+            velocity_up=_opt("velocity_up"),
+        )
+        _reply("ok" if ok else "error", msg)
+
+    # ===== END FIRE INCIDENT SIMULATION =====
+
     def on_shutdown(self):
         """Clean up when the manager is shut down"""
         carb.log_info("[CustomMessageManager] Shutting down...")
@@ -1667,6 +1803,11 @@ class CustomMessageManager:
         if self._usd_spawner:
             self._usd_spawner.on_shutdown()
             self._usd_spawner = None
+
+        # Extinguish any active fire incidents and remove Flow prims
+        if self._fire_manager:
+            self._fire_manager.on_shutdown()
+            self._fire_manager = None
 
         # Clean up subscriptions
         for sub in self._subscriptions:
