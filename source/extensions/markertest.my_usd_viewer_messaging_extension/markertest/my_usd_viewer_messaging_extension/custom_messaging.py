@@ -139,6 +139,7 @@ class CustomMessageManager:
             'startMarkerPlacement':    self._on_start_marker_placement,
             'cancelMarkerPlacement':   self._on_cancel_marker_placement,
             'saveNavMarkerHere':       self._on_save_nav_marker_here,
+            'setMarkerImage':          self._on_set_marker_image,
             'startCameraBroadcast':    self._on_start_camera_broadcast,
             'stopCameraBroadcast':     self._on_stop_camera_broadcast,
             # Fire incident simulation
@@ -1516,12 +1517,16 @@ class CustomMessageManager:
         markers_list = []
         for key, data in self._markers.items():
             raw_pos = data.get("position", [0.0, 0.0, 0.0])
+            img = data.get("image_url", "")
             markers_list.append({
-                "key":   key,
-                "label": data.get("label", key),
-                # Round to 3 dp — millimetre precision is plenty for screen projection
-                "position": [round(float(v), 3) for v in raw_pos],
-                "type":  data.get("type", "navigation"),
+                "key":       key,
+                "label":     data.get("label", key),
+                "position":  [round(float(v), 3) for v in raw_pos],
+                "type":      data.get("type", "navigation"),
+                # True when a pre-set infographic path/URL exists (not a captured frame).
+                # Captured frames start with "data:" but are regenerated on every click,
+                # so we only flag manually-assigned images.
+                "has_image": bool(img and not img.startswith("data:")),
             })
         get_eventdispatcher().dispatch_event(
             "markersResponse",
@@ -1626,18 +1631,21 @@ class CustomMessageManager:
                 final_img_url = None
                 thumbnail_b64 = None
 
-                if image_url:
-                    final_img_url = image_url
+                # Try to resolve a pre-set infographic (local file or URL).
+                resolved = self._resolve_infographic(image_url)
+                if resolved:
+                    final_img_url = resolved
                 else:
-                    # Capture viewport as the infographic
+                    # No pre-set image — capture the current viewport instead.
                     frame_data = await self._viewport_capture.capture_frame_async(width=1280, height=720)
                     if frame_data:
                         thumbnail_b64, _ = self._compress_planogram_frame(frame_data)
                         if thumbnail_b64:
                             data_uri = f"data:image/jpeg;base64,{thumbnail_b64}"
+                            # Cache the captured frame on the marker so subsequent
+                            # clicks reuse it until a real infographic is set.
                             marker["image_url"] = data_uri
                             self._save_markers()
-                            # Persist on the USD prim too
                             try:
                                 import omni.usd
                                 stage = omni.usd.get_context().get_stage()
@@ -1940,6 +1948,66 @@ class CustomMessageManager:
             "markerPlaced",
             payload={"key": key, "label": name, "type": "navigation"},
         )
+
+    def _on_set_marker_image(self, event: carb.events.IEvent) -> None:
+        """Store a local infographic filename/path for an info marker."""
+        payload = getattr(event, "payload", {}) or {}
+        key        = payload.get("key", "")
+        image_path = payload.get("image_path", "").strip()
+        if key not in self._markers:
+            carb.log_warn(f"[CustomMessageManager] setMarkerImage: unknown key '{key}'")
+            return
+        self._markers[key]["image_url"] = image_path
+        self._save_markers()
+        self._dispatch_markers()
+        carb.log_info(f"[CustomMessageManager] setMarkerImage '{key}' → '{image_path}'")
+
+    def _resolve_infographic(self, image_url: str) -> Optional[str]:
+        """Resolve image_url to a data URI, handling local file paths.
+
+        Priority:
+          1. Already a data URI or http(s) URL → return as-is.
+          2. Filename only → look in <markers_dir>/infographics/<filename>.
+          3. Relative path → resolve relative to the markers.json directory.
+          4. Absolute path → read directly.
+        Returns None if the file cannot be found or read.
+        """
+        if not image_url:
+            return None
+        if image_url.startswith("data:") or image_url.startswith("http"):
+            return image_url
+
+        markers_dir     = os.path.dirname(self._markers_file)
+        infographics_dir = os.path.join(markers_dir, "infographics")
+
+        candidates = [
+            os.path.join(infographics_dir, os.path.basename(image_url)),
+            os.path.join(markers_dir, image_url),
+        ]
+        if os.path.isabs(image_url):
+            candidates.insert(0, image_url)
+
+        for path in candidates:
+            if os.path.exists(path):
+                result = self._file_to_data_uri(path)
+                if result:
+                    return result
+
+        carb.log_warn(f"[CustomMessageManager] Infographic not found: {image_url}")
+        return None
+
+    @staticmethod
+    def _file_to_data_uri(path: str) -> Optional[str]:
+        """Read a local image file and return it as a base64 data URI."""
+        try:
+            import base64, mimetypes
+            mime = mimetypes.guess_type(path)[0] or "image/jpeg"
+            with open(path, "rb") as fh:
+                b64 = base64.b64encode(fh.read()).decode("ascii")
+            return f"data:{mime};base64,{b64}"
+        except Exception as exc:
+            carb.log_warn(f"[CustomMessageManager] Cannot read infographic '{path}': {exc}")
+            return None
 
     @staticmethod
     def _prim_world_position(prim) -> Optional[list]:
