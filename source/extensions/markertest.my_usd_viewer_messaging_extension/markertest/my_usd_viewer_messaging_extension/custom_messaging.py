@@ -976,6 +976,40 @@ class CustomMessageManager:
             )
 
     @staticmethod
+    @staticmethod
+    def _compress_marker_thumbnail(frame_b64: str, max_width: int = 400) -> Optional[str]:
+        """Compress a viewport capture to a small JPEG safe for the WebRTC data channel.
+
+        Target: ≤ 30 KB base64 so the full markerInfoResponse stays well under 64 KB.
+        Returns None if compression is not available — caller should show description only.
+        """
+        import base64 as _b64
+        import io as _io
+        try:
+            from PIL import Image as _Image
+            raw = _b64.b64decode(frame_b64)
+            img = _Image.open(_io.BytesIO(raw)).convert("RGB")
+
+            # Scale down to max_width
+            if img.width > max_width:
+                ratio = max_width / img.width
+                img = img.resize(
+                    (max_width, int(img.height * ratio)), _Image.LANCZOS
+                )
+
+            # Progressively reduce quality until the base64 fits in ~30 KB
+            for quality in (65, 55, 45, 35):
+                buf = _io.BytesIO()
+                img.save(buf, format="JPEG", quality=quality, optimize=True)
+                b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
+                if len(b64) <= 30 * 1024:
+                    return b64
+            return None   # Could not get small enough — skip image
+        except Exception as exc:
+            carb.log_warn(f"[CustomMessageManager] Marker thumbnail compression failed: {exc}")
+            return None   # Do NOT fall back to raw frame — it would exceed WebRTC limit
+
+    @staticmethod
     def _compress_planogram_frame(frame_b64: str):
         """
         Return (thumbnail_b64, vision_b64).
@@ -1653,14 +1687,15 @@ class CustomMessageManager:
                 if resolved:
                     final_img_url = resolved
                 else:
-                    # No pre-set image — capture the current viewport instead.
-                    frame_data = await self._viewport_capture.capture_frame_async(width=1280, height=720)
+                    # No pre-set image — capture the current viewport.
+                    # Use small capture dimensions so the raw frame is manageable
+                    # even if PIL compression is unavailable.
+                    frame_data = await self._viewport_capture.capture_frame_async(width=640, height=360)
                     if frame_data:
-                        thumbnail_b64, _ = self._compress_planogram_frame(frame_data)
+                        thumbnail_b64 = self._compress_marker_thumbnail(frame_data)
                         if thumbnail_b64:
                             data_uri = f"data:image/jpeg;base64,{thumbnail_b64}"
-                            # Cache the captured frame on the marker so subsequent
-                            # clicks reuse it until a real infographic is set.
+                            # Cache so next click skips re-capture.
                             marker["image_url"] = data_uri
                             self._save_markers()
                             try:
@@ -1677,11 +1712,12 @@ class CustomMessageManager:
                 get_eventdispatcher().dispatch_event(
                     "markerInfoResponse",
                     payload={
-                        "key": key,
-                        "label": label,
-                        "message": description if description else f"Information for {label}.",
-                        "captured_frame": None if final_img_url else thumbnail_b64,
-                        "image_url": final_img_url,
+                        "key":           key,
+                        "label":         label,
+                        "message":       description if description else f"Information for {label}.",
+                        "captured_frame": None,        # always None — image_url carries the data URI
+                        "image_url":     final_img_url,
+                        "loading":       False,
                     }
                 )
             except Exception as e:
