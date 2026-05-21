@@ -1895,7 +1895,7 @@ class CustomMessageManager:
         rotation    = cam_data.get("rotation", [0.0, 0.0, 0.0])
 
         # Lift beacon above camera so the sphere never encloses the camera frustum.
-        _BEACON_LIFT = 50.0
+        _BEACON_LIFT = 25.0
         try:
             import omni.usd
             from pxr import UsdGeom as _UsdGeom

@@ -1906,7 +1906,7 @@ class CustomMessageManager:
         # Offset the beacon above the camera so the sphere never encloses the
         # camera frustum (which darkens the view). 50 units is well clear of the
         # 4-unit beacon radius; detect up-axis so it works in both Y-up and Z-up scenes.
-        _BEACON_LIFT = 50.0
+        _BEACON_LIFT = 25.0
         try:
             import omni.usd
             from pxr import UsdGeom as _UsdGeom
