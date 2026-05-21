@@ -54,8 +54,8 @@ class CustomMessageManager:
             "chatError",                # Chat error notification
             # Planogram
             "planogramCaptureResponse",  # Small thumbnail after frame capture
-            "planogramAnalysisResult",   # Structured row analysis from backend
             "analyzeShelfResponse",      # Combined vision + row-detection planogram
+            "automaticShelfAnalysisResponse",  # Automatic shelf analysis (route-based)
             # Camera nav position registry
             "navPositionsResponse",      # Full positions list (after any CRUD operation)
             "cameraPositionResponse",    # Current camera position query result
@@ -81,8 +81,8 @@ class CustomMessageManager:
             'chatCancel': self._on_chat_cancel,
             # Planogram
             'planogramCaptureRequest': self._on_planogram_capture_request,
-            'planogramAnalyzeRequest': self._on_planogram_analyze_request,
             'analyzeShelfRequest':     self._on_analyze_shelf_request,
+            'automaticShelfAnalysisRequest': self._on_automatic_shelf_analysis_request,
             # Camera nav position registry
             'getNavPositions':     self._on_get_nav_positions,
             'registerNavPosition': self._on_register_nav_position,
@@ -828,20 +828,12 @@ class CustomMessageManager:
     # (~64 KB limit).  Strategy:
     #   1. planogramCaptureRequest  → Kit captures, stores full JPEG in memory,
     #                                 sends a small thumbnail (~15 KB) to browser.
-    #   2. planogramAnalyzeRequest  → Kit sends stored full JPEG to backend,
-    #                                 returns structured result to browser.
     # The large image never travels over WebRTC.
 
     def _on_planogram_capture_request(self, event: carb.events.IEvent):
         """Handle planogramCaptureRequest — capture and store frame, send thumbnail."""
         carb.log_info("[CustomMessageManager] planogramCaptureRequest received")
         asyncio.ensure_future(self._capture_and_send_planogram_frame())
-
-    def _on_planogram_analyze_request(self, event: carb.events.IEvent):
-        """Handle planogramAnalyzeRequest — POST stored frame to backend, return result."""
-        payload = event.payload
-        carb.log_info(f"[CustomMessageManager] planogramAnalyzeRequest: {payload}")
-        asyncio.ensure_future(self._run_planogram_analysis(payload))
 
     async def _capture_and_send_planogram_frame(self):
         """Capture viewport, compress to JPEG, store full-res, send small thumbnail."""
@@ -871,47 +863,6 @@ class CustomMessageManager:
             carb.log_error(f"[CustomMessageManager] Planogram capture error: {exc}")
             get_eventdispatcher().dispatch_event(
                 "planogramCaptureResponse",
-                payload={"success": False, "error": str(exc)},
-            )
-
-    async def _run_planogram_analysis(self, payload: dict):
-        """POST stored full-res frame to backend and dispatch result to browser."""
-        vision_b64 = getattr(self, '_planogram_frame', None)
-        if not vision_b64:
-            get_eventdispatcher().dispatch_event(
-                "planogramAnalysisResult",
-                payload={"success": False, "error": "No captured frame — capture first"},
-            )
-            return
-
-        model     = payload.get("model", "qwen")
-        num_rows  = int(payload.get("num_rows", 4))
-        shelf_id  = payload.get("shelf_id", "Shelf_1")
-        backend   = self._agent_client._base_url
-        url       = f"{backend}/api/planogram/analyze"
-        body      = {"frame_data": vision_b64, "model": model, "num_rows": num_rows, "shelf_id": shelf_id}
-
-        carb.log_info(f"[CustomMessageManager] Posting planogram to {url} model={model} rows={num_rows}")
-
-        try:
-            import json as _json
-            import urllib.request as _urllib
-            data = _json.dumps(body).encode("utf-8")
-            req  = _urllib.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-            loop = asyncio.get_event_loop()
-            resp_data = await loop.run_in_executor(
-                None,
-                lambda: _json.loads(_urllib.urlopen(req, timeout=300).read().decode("utf-8"))
-            )
-            carb.log_info(f"[CustomMessageManager] Planogram result: {str(resp_data)[:200]}")
-            get_eventdispatcher().dispatch_event(
-                "planogramAnalysisResult",
-                payload={"success": True, **resp_data},
-            )
-        except Exception as exc:
-            carb.log_error(f"[CustomMessageManager] Planogram analysis error: {exc}")
-            get_eventdispatcher().dispatch_event(
-                "planogramAnalysisResult",
                 payload={"success": False, "error": str(exc)},
             )
 
@@ -955,10 +906,11 @@ class CustomMessageManager:
         """
         Full pipeline:
         1. Capture viewport frame
-        2. POST to /api/identify-shelf-products → list of asset_keys
+        2. POST to /api/identify-shelf-products → list of asset_keys + product_info
         3. For each key, call usd_spawner.detect_rows_for_key()
         4. Merge per-product rows into unified shelf levels by floor_z
-        5. Dispatch analyzeShelfResponse
+        5. Enrich with stock / initial_stock from product_info
+        6. Dispatch analyzeShelfResponse
         """
         import json as _json
         import urllib.request as _urllib
@@ -966,6 +918,7 @@ class CustomMessageManager:
         tolerance  = float(payload.get("tolerance_cm", 8.0))
         model      = payload.get("model", "qwen")
         asset_keys = payload.get("asset_keys")  # pre-filled → skip vision (refresh mode)
+        product_info: dict = payload.get("product_info") or {}
 
         def _err(msg: str):
             get_eventdispatcher().dispatch_event(
@@ -999,6 +952,7 @@ class CustomMessageManager:
                     ),
                 )
                 asset_keys = resp.get("products", [])
+                product_info = resp.get("product_info", {})
             except Exception as exc:
                 carb.log_error(f"[CustomMessageManager] identify-shelf-products failed: {exc}")
                 _err(f"Product identification failed: {exc}")
@@ -1025,12 +979,37 @@ class CustomMessageManager:
         # 4. Merge into unified shelf levels aligned by floor_z
         shelf_levels = self._merge_shelf_levels(all_rows, tolerance)
 
-        # Strip prim_paths before sending — arrays can exceed the 65 KB WebRTC limit
+        # 5. Enrich with stock / initial_stock from product_info
+        product_shelf_count: dict = {}
         for lv in shelf_levels:
-            for prod in lv.get("products", {}).values():
-                prod.pop("prim_paths", None)
+            for key in lv.get("products", {}):
+                product_shelf_count[key] = product_shelf_count.get(key, 0) + 1
 
-        # 5. Respond
+        total_stock = 0
+        total_initial_stock = 0
+
+        for lv in shelf_levels:
+            shelf_stock = 0
+            shelf_init = 0
+            for key, prod_data in lv.get("products", {}).items():
+                current_count = prod_data.get("count", 0)
+                info = product_info.get(key, {})
+                product_init_stock = info.get("initial_stock", 0) or 0
+                num_shelves = product_shelf_count.get(key, 1)
+                shelf_init_stock = round(product_init_stock / num_shelves) if num_shelves > 0 else 0
+
+                prod_data["stock"] = current_count
+                prod_data["initial_stock"] = shelf_init_stock
+                prod_data.pop("prim_paths", None)
+
+                shelf_stock += current_count
+                shelf_init += shelf_init_stock
+
+            lv["shelf_stock_level"] = round(shelf_stock / shelf_init, 2) if shelf_init > 0 else 0.0
+            total_stock += shelf_stock
+            total_initial_stock += shelf_init
+
+        # 6. Respond
         get_eventdispatcher().dispatch_event(
             "analyzeShelfResponse",
             payload={
@@ -1039,6 +1018,9 @@ class CustomMessageManager:
                 "asset_keys":   list(all_rows.keys()),
                 "thumbnail":    thumbnail_b64,
                 "tolerance_cm": tolerance,
+                "stock":        total_stock,
+                "initial_stock": total_initial_stock,
+                "stock_level":  round(total_stock / total_initial_stock, 2) if total_initial_stock > 0 else 0.0,
             },
         )
 
@@ -1082,6 +1064,250 @@ class CustomMessageManager:
             shelf_levels.append({"level": level_num, "floor_z": avg_z, "products": products})
 
         return shelf_levels
+
+    # ===== AUTOMATIC SHELF ANALYSIS (route-based) =====
+
+    PLANOGRAM_ROUTE_PREFIX = "planogram_analysis_"
+
+    def _on_automatic_shelf_analysis_request(self, event: carb.events.IEvent):
+        """Handle automaticShelfAnalysisRequest — run shelf analysis along a route."""
+        route_name = event.payload.get("route", "").strip()
+        if not route_name:
+            get_eventdispatcher().dispatch_event(
+                "automaticShelfAnalysisResponse",
+                payload={"success": False, "error": "No route specified"},
+            )
+            return
+        carb.log_info(f"[CustomMessageManager] automaticShelfAnalysisRequest route={route_name}")
+        asyncio.ensure_future(self._run_automatic_shelf_analysis(route_name, dict(event.payload)))
+
+    async def _run_automatic_shelf_analysis(self, route_name: str, payload: dict) -> dict:
+        """
+        Automated shelf stock analysis along a planogram route.
+
+        For each waypoint in the route:
+        1. Teleport hidden camera to waypoint position
+        2. Capture a frame
+        3. POST to /api/identify-shelf-products → asset_keys + product_info + rack
+        4. Run row detection per product (reuse _merge_shelf_levels)
+        5. Compute stock ratios using initial_stock from product_info
+
+        After all waypoints: merge results that share the same rack (majority
+        vote on rack_id) and deduplicate products across merged waypoints.
+
+        Returns list of per-rack analysis results dispatched via
+        automaticShelfAnalysisResponse.
+        """
+        import json as _json
+        import urllib.request as _urllib
+        from .cctv_capture import get_cctv_capture
+
+        tolerance = float(payload.get("tolerance_cm", 8.0))
+        model = payload.get("model", "qwen")
+        capture_width = int(payload.get("capture_width", 1920))
+        capture_height = int(payload.get("capture_height", 1080))
+
+        def _err(msg: str):
+            get_eventdispatcher().dispatch_event(
+                "automaticShelfAnalysisResponse",
+                payload={"success": False, "error": msg},
+            )
+            return {"success": False, "error": msg}
+
+        # Get route waypoints
+        route_data = self._camera_navigation.get_all_routes().get(route_name)
+        if not route_data:
+            return _err(f"Route '{route_name}' not found")
+
+        waypoints = route_data.get("waypoints", [])
+        if not waypoints:
+            return _err(f"Route '{route_name}' has no waypoints")
+
+        carb.log_info(f"[AutoShelfAnalysis] Starting analysis on route '{route_name}' with {len(waypoints)} waypoint(s)")
+
+        # Use the CCTV capture infrastructure for the hidden camera
+        cctv = get_cctv_capture()
+        if not cctv._ensure_cctv_camera():
+            return _err("Failed to create hidden camera")
+        use_hydra = cctv._ensure_hydra_texture(width=capture_width, height=capture_height)
+        carb.log_info(
+            f"[AutoShelfAnalysis] Capture settings: hydra={use_hydra} "
+            f"requested={capture_width}x{capture_height}"
+        )
+
+        backend = self._agent_client._base_url
+
+        # Collect per-waypoint raw results before merging
+        wp_raw_results = []
+
+        for wp_idx, wp in enumerate(waypoints):
+            location = wp.get("location", [0, 0, 0])
+            rotation = wp.get("rotation", [0, 0, 0])
+
+            carb.log_info(f"[AutoShelfAnalysis] Waypoint {wp_idx + 1}/{len(waypoints)} at {location}")
+
+            # 1. Teleport hidden camera
+            if not cctv._set_cctv_camera_pose(location, rotation):
+                carb.log_warn(f"[AutoShelfAnalysis] Skipping waypoint {wp_idx + 1} — pose set failed")
+                continue
+
+            await asyncio.sleep(0.15)
+
+            # 2. Capture frame
+            if use_hydra:
+                frame_b64 = await cctv._capture_single_frame()
+            else:
+                frame_b64 = await cctv._capture_via_active_viewport()
+
+            if not frame_b64:
+                carb.log_warn(f"[AutoShelfAnalysis] Skipping waypoint {wp_idx + 1} — capture failed")
+                continue
+
+            vision_b64 = frame_b64
+
+            # 3. Identify products via backend (enriched endpoint)
+            url = f"{backend}/api/identify-shelf-products"
+            body = _json.dumps({"frame_data": vision_b64, "model": model}).encode("utf-8")
+            try:
+                loop = asyncio.get_event_loop()
+                resp = await loop.run_in_executor(
+                    None,
+                    lambda: _json.loads(
+                        _urllib.urlopen(
+                            _urllib.Request(url, data=body,
+                                           headers={"Content-Type": "application/json"},
+                                           method="POST"),
+                            timeout=120,
+                        ).read().decode("utf-8")
+                    ),
+                )
+            except Exception as exc:
+                carb.log_error(f"[AutoShelfAnalysis] identify-shelf-products failed at wp{wp_idx + 1}: {exc}")
+                continue
+
+            asset_keys = resp.get("products", [])
+            product_info = resp.get("product_info", {})
+            rack_id = resp.get("rack_id")
+            rack_name = resp.get("rack_name", rack_id or "Unknown")
+
+            if not asset_keys:
+                carb.log_warn(f"[AutoShelfAnalysis] No products at waypoint {wp_idx + 1}")
+                continue
+
+            # 4. Row detection per product
+            all_rows: dict = {}
+            for key in asset_keys:
+                result = self._usd_spawner.detect_rows_for_key(key, tolerance)
+                if result and result.get("rows"):
+                    all_rows[key] = result["rows"]
+
+            if not all_rows:
+                carb.log_warn(f"[AutoShelfAnalysis] No shelf rows detected at waypoint {wp_idx + 1}")
+                continue
+
+            wp_raw_results.append({
+                "waypoint": wp_idx + 1,
+                "location": location,
+                "rotation": rotation,
+                "rack_id": rack_id,
+                "rack_name": rack_name,
+                "all_rows": all_rows,
+                "product_info": product_info,
+                "asset_keys": asset_keys,
+            })
+
+        if not wp_raw_results:
+            return _err("No waypoints produced results")
+
+        # ── Merge waypoints by rack_id ──────────────────────────────────────
+        # Group waypoints by rack_id. Products seen in multiple waypoints for
+        # the same rack are deduplicated (same asset_key = same product).
+        rack_groups: dict = {}  # rack_id → list of wp_raw dicts
+        for wp_raw in wp_raw_results:
+            rid = wp_raw["rack_id"] or "unknown"
+            rack_groups.setdefault(rid, []).append(wp_raw)
+
+        results = []
+        for rid, group in rack_groups.items():
+            # Rack name: use the name from the first waypoint
+            rack_name = group[0]["rack_name"]
+
+            # Merge all_rows across waypoints, deduplicating by asset_key.
+            # Same asset_key in multiple waypoints = same products (no double-count).
+            # We take the union: for each product, keep the entry with the highest count.
+            merged_rows: dict = {}
+            merged_product_info: dict = {}
+            for wp_raw in group:
+                for key, rows in wp_raw["all_rows"].items():
+                    if key not in merged_rows:
+                        merged_rows[key] = rows
+                    # else: already counted — skip duplicate
+                merged_product_info.update(wp_raw["product_info"])
+
+            # Merge into unified shelf levels
+            shelf_levels = self._merge_shelf_levels(merged_rows, tolerance)
+
+            # Compute stock ratios
+            product_shelf_count: dict = {}
+            for lv in shelf_levels:
+                for key in lv.get("products", {}):
+                    product_shelf_count[key] = product_shelf_count.get(key, 0) + 1
+
+            total_stock = 0
+            total_initial_stock = 0
+
+            for lv in shelf_levels:
+                shelf_stock = 0
+                shelf_init = 0
+                for key, prod_data in lv.get("products", {}).items():
+                    current_count = prod_data.get("count", 0)
+                    info = merged_product_info.get(key, {})
+                    product_init_stock = info.get("initial_stock", 0) or 0
+                    num_shelves = product_shelf_count.get(key, 1)
+                    shelf_init_stock = round(product_init_stock / num_shelves) if num_shelves > 0 else 0
+
+                    prod_data["stock"] = current_count
+                    prod_data["initial_stock"] = shelf_init_stock
+                    prod_data.pop("prim_paths", None)
+                    prod_data.pop("count", None)
+
+                    shelf_stock += current_count
+                    shelf_init += shelf_init_stock
+
+                lv["shelf_stock_level"] = round(shelf_stock / shelf_init, 2) if shelf_init > 0 else 0.0
+                total_stock += shelf_stock
+                total_initial_stock += shelf_init
+
+            rack_result = {
+                "rack_id": rid,
+                "rack_name": rack_name,
+                "waypoint_count": len(group),
+                "products": list(merged_rows.keys()),
+                "stock_level": round(total_stock / total_initial_stock, 2) if total_initial_stock > 0 else 0.0,
+                "stock": total_stock,
+                "initial_stock": total_initial_stock,
+                "shelf_levels": shelf_levels,
+                "asset_keys": list(merged_rows.keys()),
+            }
+            results.append(rack_result)
+            carb.log_info(
+                f"[AutoShelfAnalysis] Rack {rack_name}: "
+                f"stock={total_stock}/{total_initial_stock} levels={len(shelf_levels)} "
+                f"(merged from {len(group)} waypoint(s))"
+            )
+
+        # Dispatch results
+        get_eventdispatcher().dispatch_event(
+            "automaticShelfAnalysisResponse",
+            payload={
+                "success": True,
+                "route": route_name,
+                "waypoint_count": len(waypoints),
+                "results": results,
+            },
+        )
+        carb.log_info(f"[AutoShelfAnalysis] Completed: {len(results)} racks from {len(wp_raw_results)} waypoints")
+        return {"success": True, "results": results}
 
     # ===== CAMERA NAV POSITION REGISTRY =====
 
@@ -1446,3 +1672,7 @@ class CustomMessageManager:
         for sub in self._subscriptions:
             sub.unsubscribe()
         self._subscriptions.clear()
+
+
+# Module-level reference set by Extension.on_startup() for API server access
+_manager_instance: Optional[CustomMessageManager] = None

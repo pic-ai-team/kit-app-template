@@ -149,14 +149,26 @@ ASSET_LIBRARY: dict[str, str] = {
     **{k: f"{_USD_ASSETS}/{f}" for k, f in [
         # Snacks (USD-Assets)
         ("lays_bags",                "Lays_Bags.usdz"),
+        ("lays_cheddar",             "Lays_Cheddar.usdz"),
+        ("lays_chile_limon",         "Lays_Chile_Limon.usdz"),
+        ("lays_classic",             "Lays_Classic.usdz"),
+        ("lays_dill_pickle",         "Lays_Dill_Pickle.usdz"),
+        ("lays_flaming_hot",         "Lays_Flaming_Hot.usdz"),
+        ("lays_sweet_bbq",           "Lays_Sweet_BBQ.usdz"),
         ("doritos_blue_cool_ranch",  "Doritos_blue_cool_ranch.usdz"),
         ("doritos_nacho",            "Doritos_Nacho.usdz"),
+        ("doritos_flaming_hot",      "Doritos_Flamin_Hot_Nacho.usdz"),
+        ("doritos_blazin_buffalo_ranch", "Doritos_Blazin_Buffalo_Ranch.usdz"),
         ("doritos_bags",             "Doritos_bags.usdz"),
         ("doritos_bbq",              "Doritos_bbq.usdz"),
-        ("red_doritos",              "Red_doritos.usdz"),
+        ("doritos_nacho_cheese",     "Doritos_Nacho_Cheese.usdz"),
         ("cheetos_flaming_hot",      "Cheetos_Flaming_Hot.usdz"),
         ("cheetos_puffs",            "Cheetos_Puffs.usdz"),
         ("cheetos_cheddar_jalapeno", "Cheetos_Cheddar_Jalapeno.usdz"),
+        ("calbee_chips",             "Calbee_Chips.usdz"),
+        ("calbee_hot_spicy_potato_chips", "Calbee_Hot__Spicy_Potato_Chips.usdz"),
+        ("calbee_potato_chips_pizza", "Calbee_Potato_Chips_Pizza.usdz"),
+
         # Props (USD-Assets)
         ("wine_bottles",             "Wine_bottles.usdz"),
         ("liquor_bottles",           "Liquor_bottles.usdz"),
@@ -290,16 +302,36 @@ for _k, _fp in ASSET_LIBRARY.items():
     _STEM_TO_KEY[_stem.replace("-", "_")] = _k
     _KEY_TO_STEM[_k] = _stem
     _ASSET_UNIT_SCALE[_k] = 1.0 if _fp.startswith(_USD_ASSETS) else 100.0
+_STEM_TO_KEY_LOWER: dict[str, str] = {k.lower(): v for k, v in _STEM_TO_KEY.items()}
 
 
 def _resolve_prim_key(prim_name: str) -> str | None:
     """Map a stage prim name (with optional numeric suffix) to an asset_key."""
     base = re.sub(r"_\d+$", "", prim_name)
+
+    # First allow direct asset-key prim names used by spawned items, e.g.
+    # /World/pringles_bbq_10 -> pringles_bbq.
+    for candidate in (
+        prim_name,
+        base,
+        prim_name.replace("-", "_"),
+        base.replace("-", "_"),
+    ):
+        if candidate in ASSET_LIBRARY:
+            return candidate
+        lower_candidate = candidate.lower()
+        if lower_candidate in ASSET_LIBRARY:
+            return lower_candidate
+
     return (
         _STEM_TO_KEY.get(prim_name)
         or _STEM_TO_KEY.get(base)
         or _STEM_TO_KEY.get(prim_name.replace("-", "_"))
         or _STEM_TO_KEY.get(base.replace("-", "_"))
+        or _STEM_TO_KEY_LOWER.get(prim_name.lower())
+        or _STEM_TO_KEY_LOWER.get(base.lower())
+        or _STEM_TO_KEY_LOWER.get(prim_name.replace("-", "_").lower())
+        or _STEM_TO_KEY_LOWER.get(base.replace("-", "_").lower())
     )
 
 
@@ -527,12 +559,18 @@ class UsdSpawner:
         inventory: dict = {}
         xf_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
 
-        def _scan_prim(prim, shelf: str, depth: int) -> None:
+        def _scan_prim(prim, depth: int) -> None:
             """Recursively scan prims; record known assets, recurse into groups."""
             if depth > 4:
                 return
             prim_name = prim.GetName()
             prim_path = str(prim.GetPath())
+
+            # Ignore template/source prims that should not count as live inventory.
+            # Prototypes are the main instances for each asset that are referenced by all other copies;
+            # they can never be deleted and are invisible in the scene.
+            if prim_path == "/World/Prototypes" or prim_path.startswith("/World/Prototypes/"):
+                return
 
             # Resolve asset_key from prim name (strip trailing _N suffix first)
             base = re.sub(r"_\d+$", "", prim_name)
@@ -547,6 +585,27 @@ class UsdSpawner:
             if asset_key:
                 # Known product — record with position and shelf group
                 position = [0.0, 0.0, 0.0]
+                rack_id = None
+                shelf_level = None
+
+                # Prefer explicit prim attributes; keep None when missing.
+                try:
+                    rack_attr = prim.GetAttribute("rack_id")
+                    if rack_attr and rack_attr.HasAuthoredValueOpinion():
+                        _rack_val = rack_attr.Get(Usd.TimeCode.Default())
+                        if _rack_val is not None:
+                            _rack_str = str(_rack_val).strip()
+                            rack_id = _rack_str or None
+
+                    shelf_attr = prim.GetAttribute("shelf_level")
+                    if shelf_attr and shelf_attr.HasAuthoredValueOpinion():
+                        _shelf_val = shelf_attr.Get(Usd.TimeCode.Default())
+                        if _shelf_val is not None:
+                            _shelf_str = str(_shelf_val).strip()
+                            shelf_level = _shelf_str or None
+                except Exception as exc:
+                    carb.log_warn(f"[UsdSpawner] Stage scan: attribute read failed for {prim_path}: {exc}")
+
                 try:
                     xform_api = UsdGeom.Xformable(prim)
                     translate_op = next(
@@ -587,19 +646,18 @@ class UsdSpawner:
                     "usd_path":    ASSET_LIBRARY.get(asset_key, ""),
                     "position":    position,
                     "prim_name":   prim_name,
-                    "shelf":       shelf,
+                    "rack_id":     rack_id,
+                    "shelf_level": shelf_level,
                     "unit_count":  unit_count,
                     "source":      "stage_scan",
                 }
             else:
-                # Not a known product — treat as a group/shelf and recurse.
-                # At depth=1 (direct child of /World) use its name as the shelf label.
-                child_shelf = prim_name if depth == 1 else shelf
+                # Not a known product — recurse into child prims.
                 for child in prim.GetChildren():
-                    _scan_prim(child, child_shelf, depth + 1)
+                    _scan_prim(child, depth + 1)
 
         for child in world.GetChildren():
-            _scan_prim(child, "", 1)
+            _scan_prim(child, 1)
 
         try:
             os.makedirs(os.path.dirname(STAGE_PRIMS_FILE), exist_ok=True)
@@ -779,10 +837,6 @@ class UsdSpawner:
         # correction so they appear upright when spawned.
         #
         # Priority: JSON file (self._rotation_corrections) > ASSET_SPAWN_ROTATION_CORRECTION
-        has_rotation_correction = (
-            prim_name in self._rotation_corrections
-            or prim_name in ASSET_SPAWN_ROTATION_CORRECTION
-        )
         effective_rotation = rotation  # may be None
 
         if prim_name in self._rotation_corrections:
@@ -886,19 +940,6 @@ class UsdSpawner:
                         f"[UsdSpawner] Shelf-snap (axis={up_idx}): bbox_min={v_min:.2f}  "
                         f"snap_to={snap_y_to:.2f}  translate {old_v:.2f} → {cur[up_idx]:.2f}"
                     )
-                elif has_rotation_correction:
-                    v_max    = rng.GetMax()[up_idx]
-                    center_v = (v_min + v_max) / 2
-                    drift    = center_v - position[up_idx]
-                    if abs(drift) > 0.5:
-                        cur = list(translate_op.Get(Usd.TimeCode.Default()))
-                        old_v = cur[up_idx]
-                        cur[up_idx] -= drift
-                        translate_op.Set(Gf.Vec3d(*cur))
-                        carb.log_warn(
-                            f"[UsdSpawner] Center-snap (axis={up_idx}): center={center_v:.2f}  "
-                            f"drift={drift:.2f}  translate {old_v:.2f} → {cur[up_idx]:.2f}"
-                        )
                 elif v_min < floor_level - 0.5:
                     cur = list(translate_op.Get(Usd.TimeCode.Default()))
                     old_v = cur[up_idx]
