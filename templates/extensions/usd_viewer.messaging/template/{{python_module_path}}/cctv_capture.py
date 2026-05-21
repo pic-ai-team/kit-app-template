@@ -24,8 +24,8 @@ import omni.kit.app
 CCTV_PREFIX = "cctv_"
 
 # Resolution for CCTV captures
-CCTV_WIDTH = 1280
-CCTV_HEIGHT = 720
+CCTV_WIDTH = 1920
+CCTV_HEIGHT = 1080
 
 
 class CCTVCapture:
@@ -41,6 +41,7 @@ class CCTVCapture:
         self._camera_created = False
         self._hydra_texture = None
         self._drawable_sub = None
+        self._hydra_size = (CCTV_WIDTH, CCTV_HEIGHT)
         # Capture coordination: set by _capture_single_frame, consumed by _on_drawable_changed
         self._capture_state = None  # {"future": asyncio.Future, "skip": int}
 
@@ -139,10 +140,23 @@ class CCTVCapture:
     # Headless HydraTexture + event subscription
     # ------------------------------------------------------------------
 
-    def _ensure_hydra_texture(self) -> bool:
+    def _ensure_hydra_texture(self, width: int = CCTV_WIDTH, height: int = CCTV_HEIGHT) -> bool:
         """Create the off-screen HydraTexture and subscribe to its events."""
-        if self._hydra_texture is not None:
+        width = max(64, int(width))
+        height = max(64, int(height))
+        requested_size = (width, height)
+
+        if self._hydra_texture is not None and self._hydra_size == requested_size:
             return True
+
+        # Recreate texture if resolution changed
+        if self._hydra_texture is not None and self._hydra_size != requested_size:
+            carb.log_info(
+                f"[CCTVCapture] Recreating HydraTexture due to size change "
+                f"{self._hydra_size[0]}x{self._hydra_size[1]} -> {width}x{height}"
+            )
+            self._drawable_sub = None
+            self._hydra_texture = None
 
         try:
             from omni.kit.hydra_texture import create_hydra_texture, GLOBAL_EVENT_DRAWABLE_CHANGED
@@ -150,8 +164,8 @@ class CCTVCapture:
 
             ht = create_hydra_texture(
                 name="cctv_offscreen",
-                width=CCTV_WIDTH,
-                height=CCTV_HEIGHT,
+                width=width,
+                height=height,
                 usd_context_name="",
                 usd_camera_path=self.CCTV_CAMERA_PATH,
                 hydra_engine_name="rtx",
@@ -162,6 +176,7 @@ class CCTVCapture:
                 return False
 
             self._hydra_texture = ht
+            self._hydra_size = requested_size
 
             # Subscribe to frame-ready events from THIS specific HydraTexture
             self._drawable_sub = get_eventdispatcher().observe_event(
@@ -173,7 +188,7 @@ class CCTVCapture:
 
             carb.log_info(
                 f"[CCTVCapture] Created off-screen HydraTexture "
-                f"{CCTV_WIDTH}x{CCTV_HEIGHT} + event subscription"
+                f"{width}x{height} + event subscription"
             )
             return True
 
@@ -415,7 +430,7 @@ class CCTVCapture:
                     img = Image.frombytes('RGB', (width, height), data)
 
             buf = io.BytesIO()
-            img.save(buf, format='JPEG', quality=80)
+            img.save(buf, format='JPEG', quality=90)
             buf.seek(0)
             return base64.b64encode(buf.getvalue()).decode('utf-8')
 
@@ -519,6 +534,7 @@ class CCTVCapture:
 
             # Drop HydraTexture reference
             self._hydra_texture = None
+            self._hydra_size = (CCTV_WIDTH, CCTV_HEIGHT)
 
             # Remove the CCTV camera prim
             if self._camera_created:

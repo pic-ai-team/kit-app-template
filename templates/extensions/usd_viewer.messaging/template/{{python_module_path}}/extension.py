@@ -35,6 +35,9 @@ class Extension(omni.ext.IExt):
         self._custom_manager: CustomMessageManager = CustomMessageManager(
             agent_backend_url=_usd_cfg.get("backend_url", "http://localhost:8000"),
         )
+        # Expose manager instance for the API server to access
+        from . import custom_messaging as _cm_mod
+        _cm_mod._manager_instance = self._custom_manager
 
         # Start API HTTP server (allows agent backend to capture frames directly)
         asyncio.ensure_future(start_api_server(port=8100))
