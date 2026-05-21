@@ -1710,12 +1710,8 @@ class CustomMessageManager:
                 sphere.GetRadiusAttr().Set(10.0)
                 UsdGeom.Xformable(sphere.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(0, 0, 40))
                 sphere.GetDisplayColorAttr().Set([Gf.Vec3f(0.46, 0.73, 0.0)])
-            else:
-                # Cyan orb: info marker
-                orb = UsdGeom.Sphere.Define(stage, f"{marker_path}/info_sphere")
-                orb.GetRadiusAttr().Set(12.0)
-                UsdGeom.Xformable(orb.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(0, 0, 20))
-                orb.GetDisplayColorAttr().Set([Gf.Vec3f(0.0, 0.76, 1.0)])  # Cyan-blue
+            # Info markers have no 3D geometry — the browser renders a 2D overlay badge
+            # projected to screen space using the live camera matrix.
 
             carb.log_info(f"[CustomMessageManager] 3D marker created ({m_type}): {marker_path}")
         except Exception as e:
