@@ -1900,22 +1900,41 @@ class CustomMessageManager:
             carb.log_warn("[CustomMessageManager] saveNavMarkerHere: cannot read camera position")
             return
 
-        position = cam_data.get("location", [0.0, 0.0, 0.0])
-        rotation = cam_data.get("rotation", [0.0, 0.0, 0.0])
+        camera_pos = cam_data.get("location", [0.0, 0.0, 0.0])
+        rotation    = cam_data.get("rotation", [0.0, 0.0, 0.0])
+
+        # Offset the beacon above the camera so the sphere never encloses the
+        # camera frustum (which darkens the view). 50 units is well clear of the
+        # 4-unit beacon radius; detect up-axis so it works in both Y-up and Z-up scenes.
+        _BEACON_LIFT = 50.0
+        try:
+            import omni.usd
+            from pxr import UsdGeom as _UsdGeom
+            _stage = omni.usd.get_context().get_stage()
+            _up    = _UsdGeom.GetStageUpAxis(_stage) if _stage else "Y"
+        except Exception:
+            _up = "Y"
+
+        beacon_pos = list(camera_pos)
+        if _up == _UsdGeom.Tokens.z:
+            beacon_pos[2] += _BEACON_LIFT   # Z-up: raise in Z
+        else:
+            beacon_pos[1] += _BEACON_LIFT   # Y-up: raise in Y
+
         key = name.lower().replace(" ", "_")
 
         self._markers[key] = {
             "label":           name,
             "description":     description,
-            "position":        position,
+            "position":        beacon_pos,   # beacon is above camera
             "rotation":        rotation,
-            "camera_position": position,
+            "camera_position": camera_pos,   # exact camera pos kept for navigation
             "type":            "navigation",
             "image_url":       "",
         }
         self._save_markers()
-        self._create_marker_prim(key, name, position, "navigation")
-        carb.log_info(f"[CustomMessageManager] Nav marker '{key}' saved at {position}")
+        self._create_marker_prim(key, name, beacon_pos, "navigation")
+        carb.log_info(f"[CustomMessageManager] Nav marker '{key}' saved — beacon at {beacon_pos}, camera at {camera_pos}")
         self._dispatch_markers()
         get_eventdispatcher().dispatch_event(
             "markerPlaced",
