@@ -138,6 +138,7 @@ class CustomMessageManager:
             'setMarkersOnlySelection': self._on_set_markers_only_selection,
             'startMarkerPlacement':    self._on_start_marker_placement,
             'cancelMarkerPlacement':   self._on_cancel_marker_placement,
+            'saveNavMarkerHere':       self._on_save_nav_marker_here,
             'startCameraBroadcast':    self._on_start_camera_broadcast,
             'stopCameraBroadcast':     self._on_stop_camera_broadcast,
             # Fire incident simulation
@@ -1703,20 +1704,12 @@ class CustomMessageManager:
             prim.CreateAttribute("waypoint:cameraRotation", Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(*rot))
 
             if m_type == "navigation":
-                # Green pin: downward-pointing cone + sphere head
-                cone = UsdGeom.Cone.Define(stage, f"{marker_path}/pin_body")
-                cone.GetRadiusAttr().Set(8.0)
-                cone.GetHeightAttr().Set(20.0)
-                cone.GetAxisAttr().Set("Z")
-                cone_x = UsdGeom.Xformable(cone.GetPrim())
-                cone_x.AddTranslateOp().Set(Gf.Vec3d(0, 0, 25))
-                cone_x.AddRotateXYZOp().Set(Gf.Vec3f(180, 0, 0))
-                cone.GetDisplayColorAttr().Set([Gf.Vec3f(0.46, 0.73, 0.0)])  # NVIDIA green
-
-                sphere = UsdGeom.Sphere.Define(stage, f"{marker_path}/pin_head")
-                sphere.GetRadiusAttr().Set(10.0)
-                UsdGeom.Xformable(sphere.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(0, 0, 40))
-                sphere.GetDisplayColorAttr().Set([Gf.Vec3f(0.46, 0.73, 0.0)])
+                # Small green beacon sphere at camera position.
+                # Placed at eye-level (camera position) via saveNavMarkerHere.
+                # Kept small so it doesn't obscure the scene.
+                beacon = UsdGeom.Sphere.Define(stage, f"{marker_path}/beacon")
+                beacon.GetRadiusAttr().Set(4.0)
+                beacon.GetDisplayColorAttr().Set([Gf.Vec3f(0.46, 0.73, 0.0)])  # NVIDIA green
             else:
                 # Info markers: small glowing dot so the position is visible in the USD viewport.
                 # The primary interactive element is the 2D browser overlay badge, but this dot
@@ -1889,6 +1882,45 @@ class CustomMessageManager:
         """Browser cancelled the click-to-place flow."""
         self._pending_marker = None
         carb.log_info("[CustomMessageManager] Marker placement cancelled")
+
+    def _on_save_nav_marker_here(self, event: carb.events.IEvent) -> None:
+        """Save a navigation marker at the current camera position.
+        No click-to-place needed — the user navigates to the spot first,
+        then calls this to drop a beacon at their current camera location.
+        """
+        payload = getattr(event, "payload", {}) or {}
+        name = payload.get("name", "").strip()
+        description = payload.get("description", "")
+        if not name:
+            carb.log_warn("[CustomMessageManager] saveNavMarkerHere: empty name ignored")
+            return
+
+        cam_data = self._read_camera_position_robust()
+        if not cam_data:
+            carb.log_warn("[CustomMessageManager] saveNavMarkerHere: cannot read camera position")
+            return
+
+        position = cam_data.get("location", [0.0, 0.0, 0.0])
+        rotation = cam_data.get("rotation", [0.0, 0.0, 0.0])
+        key = name.lower().replace(" ", "_")
+
+        self._markers[key] = {
+            "label":           name,
+            "description":     description,
+            "position":        position,
+            "rotation":        rotation,
+            "camera_position": position,
+            "type":            "navigation",
+            "image_url":       "",
+        }
+        self._save_markers()
+        self._create_marker_prim(key, name, position, "navigation")
+        carb.log_info(f"[CustomMessageManager] Nav marker '{key}' saved at {position}")
+        self._dispatch_markers()
+        get_eventdispatcher().dispatch_event(
+            "markerPlaced",
+            payload={"key": key, "label": name, "type": "navigation"},
+        )
 
     @staticmethod
     def _prim_world_position(prim) -> Optional[list]:
