@@ -49,6 +49,9 @@ class CustomMessageManager:
         self._markers: Dict[str, Dict[str, Any]] = {}
         self._markers_file = self._resolve_markers_file()
         self._load_markers()
+        # Infographics base directory — configurable from admin panel via setInfographicsDir.
+        # Falls back to infographics/ next to markers.json.
+        self._infographics_dir: Optional[str] = os.environ.get("INFOGRAPHICS_DIR", "")
 
         # Fire incident simulation (must be created after _markers is populated)
         self._fire_manager = FireIncidentManager(self._markers)
@@ -87,6 +90,7 @@ class CustomMessageManager:
             "markersResponse",           # Full marker list
             "markerInfoResponse",        # AI-generated info for a clicked marker
             "markerPlaced",              # Confirmation after successful click-to-place
+            "infographicsDirSet",        # Confirmation after setInfographicsDir
             "cameraPositionUpdate",      # Periodic camera transform broadcast for 3D projection
             # Fire incident simulation
             "fireAlert",                 # Broadcast when a fire incident is triggered
@@ -141,6 +145,7 @@ class CustomMessageManager:
             'cancelMarkerPlacement':   self._on_cancel_marker_placement,
             'saveNavMarkerHere':       self._on_save_nav_marker_here,
             'setMarkerImage':          self._on_set_marker_image,
+            'setInfographicsDir':      self._on_set_infographics_dir,
             'startCameraBroadcast':    self._on_start_camera_broadcast,
             'stopCameraBroadcast':     self._on_stop_camera_broadcast,
             # Fire incident simulation
@@ -1950,6 +1955,21 @@ class CustomMessageManager:
             payload={"key": key, "label": name, "type": "navigation"},
         )
 
+    def _on_set_infographics_dir(self, event: carb.events.IEvent) -> None:
+        """Set the base directory where infographic images are stored."""
+        payload = getattr(event, "payload", {}) or {}
+        path = payload.get("path", "").strip()
+        if path and not os.path.isdir(path):
+            carb.log_warn(f"[CustomMessageManager] setInfographicsDir: '{path}' is not a directory")
+            return
+        self._infographics_dir = path
+        carb.log_info(f"[CustomMessageManager] Infographics dir set to: '{path or '(default)'}'")
+        # Confirm back to browser
+        get_eventdispatcher().dispatch_event(
+            "infographicsDirSet",
+            payload={"path": path, "ok": True},
+        )
+
     def _on_set_marker_image(self, event: carb.events.IEvent) -> None:
         """Store a local infographic filename/path for an info marker."""
         payload = getattr(event, "payload", {}) or {}
@@ -1978,11 +1998,13 @@ class CustomMessageManager:
         if image_url.startswith("data:") or image_url.startswith("http"):
             return image_url
 
-        markers_dir     = os.path.dirname(self._markers_file)
-        infographics_dir = os.path.join(markers_dir, "infographics")
+        markers_dir      = os.path.dirname(self._markers_file)
+        default_infographics = os.path.join(markers_dir, "infographics")
+        # Prefer the user-configured directory; fall back to the default location.
+        base_dir = (self._infographics_dir or "").strip() or default_infographics
 
         candidates = [
-            os.path.join(infographics_dir, os.path.basename(image_url)),
+            os.path.join(base_dir, os.path.basename(image_url)),
             os.path.join(markers_dir, image_url),
         ]
         if os.path.isabs(image_url):
