@@ -1935,9 +1935,9 @@ class CustomMessageManager:
             carb.log_warn(f"[CustomMessageManager] setCameraSpeed failed: {exc}")
 
     def _on_joystick_move(self, event: carb.events.IEvent) -> None:
-        """Move camera in the horizontal plane from browser joystick.
-        dx/dy are normalized joystick offsets [-1, 1].
-        dy < 0 = forward; dx > 0 = strafe right. Y is kept constant.
+        """Move camera in the horizontal floor plane from browser joystick.
+        dy < 0 = forward; dx > 0 = strafe right.
+        Handles both Y-up (floor=XZ) and Z-up (floor=XY) scenes automatically.
         """
         payload = getattr(event, "payload", {}) or {}
         dx = float(payload.get("dx", 0.0))
@@ -1950,7 +1950,15 @@ class CustomMessageManager:
         speed = speed_map.get(velocity, 10.0)
 
         try:
+            import omni.usd
             from pxr import UsdGeom, Gf, Usd
+
+            stage = omni.usd.get_context().get_stage()
+            if not stage:
+                return
+
+            up_axis = UsdGeom.GetStageUpAxis(stage)
+            z_up = (up_axis == UsdGeom.Tokens.z)
 
             result = self._camera_navigation._get_camera_and_ops()
             if result is None:
@@ -1960,22 +1968,28 @@ class CustomMessageManager:
                 return
 
             world_xform = xformable.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-
-            look_w = world_xform.TransformDir(Gf.Vec3d(0, 0, -1))
-            fwd = Gf.Vec3d(look_w[0], 0.0, look_w[2])
-            if fwd.GetLength() < 1e-6:
-                return
-            fwd = fwd.GetNormalized()
-
+            look_w  = world_xform.TransformDir(Gf.Vec3d(0, 0, -1))
             right_w = world_xform.TransformDir(Gf.Vec3d(1, 0, 0))
-            right = Gf.Vec3d(right_w[0], 0.0, right_w[2])
-            if right.GetLength() < 1e-6:
+
+            if z_up:
+                fwd   = Gf.Vec3d(look_w[0],  look_w[1],  0.0)
+                right = Gf.Vec3d(right_w[0], right_w[1], 0.0)
+            else:
+                fwd   = Gf.Vec3d(look_w[0],  0.0, look_w[2])
+                right = Gf.Vec3d(right_w[0], 0.0, right_w[2])
+
+            if fwd.GetLength() < 1e-6 or right.GetLength() < 1e-6:
                 return
+            fwd   = fwd.GetNormalized()
             right = right.GetNormalized()
 
-            cur = translate_op.Get()
+            cur   = translate_op.Get()
             delta = fwd * (-dy * speed) + right * (dx * speed)
-            translate_op.Set(Gf.Vec3d(cur[0] + delta[0], cur[1], cur[2] + delta[2]))
+
+            if z_up:
+                translate_op.Set(Gf.Vec3d(cur[0] + delta[0], cur[1] + delta[1], cur[2]))
+            else:
+                translate_op.Set(Gf.Vec3d(cur[0] + delta[0], cur[1], cur[2] + delta[2]))
 
         except Exception as exc:
             carb.log_warn(f"[CustomMessageManager] joystickMove error: {exc}")

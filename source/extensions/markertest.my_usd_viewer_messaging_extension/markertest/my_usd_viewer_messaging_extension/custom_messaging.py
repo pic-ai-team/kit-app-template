@@ -1959,10 +1959,18 @@ class CustomMessageManager:
         speed = speed_map.get(velocity, 10.0)
 
         try:
+            import omni.usd
             from pxr import UsdGeom, Gf, Usd
 
-            # _get_camera_and_ops handles matrix-op cameras and ensures
-            # the xform stack has a plain translate + rotateXYZ.
+            stage = omni.usd.get_context().get_stage()
+            if not stage:
+                return
+
+            # Detect scene up-axis: Z-up stores have floor in XY plane,
+            # Y-up stores have floor in XZ plane.
+            up_axis = UsdGeom.GetStageUpAxis(stage)   # 'Y' or 'Z'
+            z_up = (up_axis == UsdGeom.Tokens.z)
+
             result = self._camera_navigation._get_camera_and_ops()
             if result is None:
                 return
@@ -1970,27 +1978,35 @@ class CustomMessageManager:
             if translate_op is None:
                 return
 
-            # Current world transform (for direction extraction only)
             world_xform = xformable.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
 
-            # Forward = camera local -Z in world space, projected to horizontal plane
-            look_w = world_xform.TransformDir(Gf.Vec3d(0, 0, -1))
-            fwd = Gf.Vec3d(look_w[0], 0.0, look_w[2])
-            if fwd.GetLength() < 1e-6:
-                return
-            fwd = fwd.GetNormalized()
-
-            # Right = camera local +X in world space, projected to horizontal plane
+            # Project camera local -Z (look) and +X (right) to the horizontal floor plane.
+            # Z-up: floor = XY → zero out Z component, hold Z in position update.
+            # Y-up: floor = XZ → zero out Y component, hold Y in position update.
+            look_w  = world_xform.TransformDir(Gf.Vec3d(0, 0, -1))
             right_w = world_xform.TransformDir(Gf.Vec3d(1, 0, 0))
-            right = Gf.Vec3d(right_w[0], 0.0, right_w[2])
-            if right.GetLength() < 1e-6:
+
+            if z_up:
+                fwd   = Gf.Vec3d(look_w[0],  look_w[1],  0.0)
+                right = Gf.Vec3d(right_w[0], right_w[1], 0.0)
+            else:
+                fwd   = Gf.Vec3d(look_w[0],  0.0, look_w[2])
+                right = Gf.Vec3d(right_w[0], 0.0, right_w[2])
+
+            if fwd.GetLength() < 1e-6 or right.GetLength() < 1e-6:
                 return
+            fwd   = fwd.GetNormalized()
             right = right.GetNormalized()
 
-            # Existing position (keep Y to maintain camera height)
-            cur = translate_op.Get()
+            cur   = translate_op.Get()
             delta = fwd * (-dy * speed) + right * (dx * speed)
-            translate_op.Set(Gf.Vec3d(cur[0] + delta[0], cur[1], cur[2] + delta[2]))
+
+            if z_up:
+                # Hold Z (elevation) constant
+                translate_op.Set(Gf.Vec3d(cur[0] + delta[0], cur[1] + delta[1], cur[2]))
+            else:
+                # Hold Y (elevation) constant
+                translate_op.Set(Gf.Vec3d(cur[0] + delta[0], cur[1], cur[2] + delta[2]))
 
         except Exception as exc:
             carb.log_warn(f"[CustomMessageManager] joystickMove error: {exc}")
