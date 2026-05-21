@@ -2055,21 +2055,39 @@ class UsdSpawner:
     def _on_incident_spawn_request(self, event) -> None:
         """
         incidentSpawnRequest payload:
-          { incident_type: "trash" | "spill" | "random" }
+          { incident_type: "trash" | "spill" | "fire" | "random" }
 
         Spawns the corresponding incident asset at a random ground-level
         position within the configured spawn zones.
+        Fire incidents are delegated to FireIncidentManager via fireIncidentRequest.
         """
         payload = event.payload
         incident_type = str(payload.get("incident_type", "random"))
 
         carb.log_info(f"[UsdSpawner] incidentSpawnRequest  type={incident_type}")
 
-        # Resolve incident type → asset key
+        # For "random", pick from all incident types including fire
         if incident_type == "random":
-            asset_key = random.choice(list(INCIDENT_ASSETS.values()))
-        else:
-            asset_key = INCIDENT_ASSETS.get(incident_type)
+            all_types = list(INCIDENT_ASSETS.keys()) + ["fire"]
+            incident_type = random.choice(all_types)
+
+        # Fire incidents use Flow prims, not USD assets — delegate
+        if incident_type == "fire":
+            import time as _time
+            fire_id = f"fire_{int(_time.time() * 1000)}"
+            position = self._pick_random_ground_position()
+            fire_params = payload.get("fire_params", {})
+            get_eventdispatcher().dispatch_event("fireIncidentRequest", payload={
+                "action": "trigger",
+                "incident_id": fire_id,
+                "severity": "high",
+                "position": {"x": float(position[0]), "y": float(position[1]), "z": float(position[2])},
+                "fire_params": dict(fire_params) if fire_params else {},
+            })
+            return
+
+        # Resolve incident type → asset key
+        asset_key = INCIDENT_ASSETS.get(incident_type)
 
         if not asset_key:
             get_eventdispatcher().dispatch_event("incidentSpawnResponse", payload={
@@ -2112,14 +2130,27 @@ class UsdSpawner:
     def _on_incident_delete_all_request(self, event) -> None:
         """
         incidentDeleteAllRequest payload:
-          { incident_type: "trash" | "spill" | "all" }
+          { incident_type: "trash" | "spill" | "fire" | "all" }
 
         Deletes all spawned prims matching the given incident type (or all incident types).
+        Fire incidents are delegated to FireIncidentManager via fireIncidentRequest.
         """
         payload = event.payload
         incident_type = str(payload.get("incident_type", "all"))
 
         carb.log_info(f"[UsdSpawner] incidentDeleteAllRequest  type={incident_type}")
+
+        # Handle fire extinguishing
+        if incident_type == "fire":
+            get_eventdispatcher().dispatch_event("fireIncidentRequest", payload={"action": "extinguish_all"})
+            get_eventdispatcher().dispatch_event("incidentDeleteAllResponse", payload={
+                "result": "success", "count": 0, "deleted_paths": [],
+            })
+            return
+
+        # For "all", also extinguish fires
+        if incident_type == "all":
+            get_eventdispatcher().dispatch_event("fireIncidentRequest", payload={"action": "extinguish_all"})
 
         # Determine which asset keys to delete
         if incident_type == "all":
