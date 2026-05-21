@@ -142,6 +142,8 @@ class CustomMessageManager:
             # Fire incident simulation
             'fireIncidentRequest':  self._on_fire_incident_request,
             'fireAdjustRequest':    self._on_fire_adjust_request,
+            # Joystick camera speed
+            'setCameraSpeed':       self._on_set_camera_speed,
         }
 
         ed = get_eventdispatcher()
@@ -1905,6 +1907,21 @@ class CustomMessageManager:
     def _on_stop_camera_broadcast(self, event: carb.events.IEvent) -> None:
         carb.log_info("[CustomMessageManager] Stopping camera position broadcast")
         self._camera_broadcast_running = False
+
+    def _on_set_camera_speed(self, event: carb.events.IEvent) -> None:
+        """Adjust viewport camera move speed from the browser joystick velocity slider (1–5)."""
+        payload = getattr(event, "payload", {}) or {}
+        speed_level = int(payload.get("speed", 3))
+        speed_map = {1: 20.0, 2: 50.0, 3: 100.0, 4: 200.0, 5: 400.0}
+        speed_val = speed_map.get(speed_level, 100.0)
+        try:
+            import carb.settings as _cs
+            s = _cs.get_settings()
+            s.set("/persistent/app/viewport/manipulator/camera/flyAcceleration", speed_val)
+            s.set("/persistent/app/viewport/manipulator/camera/flySpeed", speed_val)
+            carb.log_info(f"[CustomMessageManager] Camera speed set to level {speed_level} ({speed_val})")
+        except Exception as exc:
+            carb.log_warn(f"[CustomMessageManager] setCameraSpeed failed: {exc}")
 
     async def _camera_broadcast_loop(self) -> None:
         while self._camera_broadcast_running:
