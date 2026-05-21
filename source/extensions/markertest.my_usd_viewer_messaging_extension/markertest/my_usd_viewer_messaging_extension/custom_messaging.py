@@ -85,6 +85,7 @@ class CustomMessageManager:
             # Waypoint markers
             "markersResponse",           # Full marker list
             "markerInfoResponse",        # AI-generated info for a clicked marker
+            "markerPlaced",              # Confirmation after successful click-to-place
             "cameraPositionUpdate",      # Periodic camera transform broadcast for 3D projection
             # Fire incident simulation
             "fireAlert",                 # Broadcast when a fire incident is triggered
@@ -1712,8 +1713,14 @@ class CustomMessageManager:
                 sphere.GetRadiusAttr().Set(10.0)
                 UsdGeom.Xformable(sphere.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(0, 0, 40))
                 sphere.GetDisplayColorAttr().Set([Gf.Vec3f(0.46, 0.73, 0.0)])
-            # Info markers have no 3D geometry — the browser renders a 2D overlay badge
-            # projected to screen space using the live camera matrix.
+            else:
+                # Info markers: small glowing dot so the position is visible in the USD viewport.
+                # The primary interactive element is the 2D browser overlay badge, but this dot
+                # gives the user spatial confirmation that the marker was placed.
+                dot = UsdGeom.Sphere.Define(stage, f"{marker_path}/info_dot")
+                dot.GetRadiusAttr().Set(3.0)
+                UsdGeom.Xformable(dot.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(0, 0, 8))
+                dot.GetDisplayColorAttr().Set([Gf.Vec3f(0.0, 0.85, 1.0)])
 
             carb.log_info(f"[CustomMessageManager] 3D marker created ({m_type}): {marker_path}")
         except Exception as e:
@@ -1831,6 +1838,10 @@ class CustomMessageManager:
                     selection.clear_selected_prim_paths()
                     carb.log_info(f"[CustomMessageManager] Placed marker '{key}' at {list(position)} via prim click")
                     self._dispatch_markers()
+                    get_eventdispatcher().dispatch_event(
+                        "markerPlaced",
+                        payload={"key": key, "label": pending["name"], "type": pending["type"]},
+                    )
                     return
                 # Clicked on nothing useful — stay in placement mode
                 return
