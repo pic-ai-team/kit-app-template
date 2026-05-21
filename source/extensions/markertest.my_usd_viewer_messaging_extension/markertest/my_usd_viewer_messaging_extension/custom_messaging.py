@@ -1596,16 +1596,17 @@ class CustomMessageManager:
         self._dispatch_markers()
 
     def _on_click_marker(self, event: carb.events.IEvent) -> None:
-        key = event.payload.get("key", "").strip()
+        key          = event.payload.get("key", "").strip()
+        skip_capture = bool(event.payload.get("skip_capture", False))
         if key not in self._markers:
             carb.log_warn(f"[CustomMessageManager] clickMarker: key '{key}' not found")
             return
 
         marker = self._markers[key]
-        carb.log_info(f"[CustomMessageManager] clickMarker '{key}' — navigating + querying agent")
-        asyncio.ensure_future(self._do_click_marker(key, marker))
+        carb.log_info(f"[CustomMessageManager] clickMarker '{key}' skip_capture={skip_capture}")
+        asyncio.ensure_future(self._do_click_marker(key, marker, skip_capture=skip_capture))
 
-    async def _do_click_marker(self, key: str, marker: Dict[str, Any]) -> None:
+    async def _do_click_marker(self, key: str, marker: Dict[str, Any], skip_capture: bool = False) -> None:
         label    = marker.get("label", key)
         description = marker.get("description", "")
         position = marker.get("position", [0, 0, 0])
@@ -1629,8 +1630,18 @@ class CustomMessageManager:
         nav.add_position(marker_nav_key, tuple(target_pos), tuple(rotation), label)
         await nav.navigate_to(marker_nav_key)
 
-        if m_type == "info":
-            # Info marker (cyan orb): show infographic panel with chatbot
+        if m_type == "info" and skip_capture:
+            # Browser already has a local image — just send description, no capture needed
+            get_eventdispatcher().dispatch_event(
+                "markerInfoResponse",
+                payload={
+                    "key": key, "label": label,
+                    "message": description if description else f"Information about {label}.",
+                    "captured_frame": None, "image_url": None, "loading": False,
+                },
+            )
+        elif m_type == "info":
+            # Info marker: navigate then capture viewport (or load pre-set infographic)
             await asyncio.sleep(0.5)
             try:
                 image_url     = marker.get("image_url", "")
