@@ -1507,16 +1507,17 @@ class CustomMessageManager:
             carb.log_error(f"[CustomMessageManager] Failed to save markers: {e}")
 
     def _dispatch_markers(self) -> None:
+        # Send only lightweight fields needed for 2D badge overlay and nav pins.
+        # Full details arrive in markerInfoResponse when a marker is clicked.
+        # This keeps the payload well under the WebRTC 64 KB data-channel limit.
         markers_list = []
         for key, data in self._markers.items():
+            raw_pos = data.get("position", [0.0, 0.0, 0.0])
             markers_list.append({
-                "key": key,
-                "label": data.get("label", key),
-                "description": data.get("description", ""),
-                "position": data.get("position", [0, 0, 0]),
-                "rotation": data.get("rotation", [0, 0, 0]),
-                "type": data.get("type", "navigation"),
-                "image_url": data.get("image_url", ""),
+                "key":      key,
+                "label":    data.get("label", key),
+                "position": [round(float(v), 3) for v in raw_pos],
+                "type":     data.get("type", "navigation"),
             })
         get_eventdispatcher().dispatch_event(
             "markersResponse",
