@@ -1954,7 +1954,7 @@ class CustomMessageManager:
             beacon_pos[1] += _BEACON_LIFT
 
         # Push beacon forward along camera's horizontal look direction.
-        _FORWARD_OFFSET = 40.0
+        _FORWARD_OFFSET = 80.0
         try:
             cam_matrix = self._read_camera_view_matrix()
             if cam_matrix:

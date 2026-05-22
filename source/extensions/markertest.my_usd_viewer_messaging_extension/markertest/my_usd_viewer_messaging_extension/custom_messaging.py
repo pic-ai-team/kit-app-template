@@ -2035,7 +2035,7 @@ class CustomMessageManager:
 
         # Push the beacon forward along the camera's horizontal look direction so it
         # appears clearly in front of the view rather than at/behind the camera origin.
-        _FORWARD_OFFSET = 40.0
+        _FORWARD_OFFSET = 80.0
         try:
             cam_matrix = self._read_camera_view_matrix()
             if cam_matrix:
