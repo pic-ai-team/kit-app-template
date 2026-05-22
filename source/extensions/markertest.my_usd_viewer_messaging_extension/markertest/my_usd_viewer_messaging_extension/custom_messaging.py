@@ -2033,6 +2033,34 @@ class CustomMessageManager:
         else:
             beacon_pos[1] += _BEACON_LIFT   # Y-up: raise in Y
 
+        # Push the beacon forward along the camera's horizontal look direction so it
+        # appears clearly in front of the view rather than at/behind the camera origin.
+        _FORWARD_OFFSET = 40.0
+        try:
+            cam_matrix = self._read_camera_view_matrix()
+            if cam_matrix:
+                vf = cam_matrix["viewMatrix"]   # row-major 4×4, world→camera
+                # Row 2 of the view matrix = camera local +Z axis in world ("back").
+                # Camera forward = -row 2.
+                fwd_x = -vf[8]
+                fwd_y = -vf[9]
+                fwd_z = -vf[10]
+                # Project to horizontal plane and normalise.
+                if _up == _UsdGeom.Tokens.z:
+                    h0, h1 = fwd_x, fwd_y          # XY horizontal for Z-up
+                    length = (h0 ** 2 + h1 ** 2) ** 0.5
+                    if length > 1e-6:
+                        beacon_pos[0] += h0 / length * _FORWARD_OFFSET
+                        beacon_pos[1] += h1 / length * _FORWARD_OFFSET
+                else:
+                    h0, h1 = fwd_x, fwd_z          # XZ horizontal for Y-up
+                    length = (h0 ** 2 + h1 ** 2) ** 0.5
+                    if length > 1e-6:
+                        beacon_pos[0] += h0 / length * _FORWARD_OFFSET
+                        beacon_pos[2] += h1 / length * _FORWARD_OFFSET
+        except Exception as exc:
+            carb.log_warn(f"[CustomMessageManager] Forward offset failed: {exc}")
+
         key = name.lower().replace(" ", "_")
 
         self._markers[key] = {
