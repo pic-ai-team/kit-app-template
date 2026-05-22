@@ -1731,6 +1731,52 @@ class CustomMessageManager:
 
     # ── 3D USD prim creation / deletion ─────────────────────────────────────
 
+    @staticmethod
+    def _define_torus_mesh(stage, path: str,
+                           major_radius: float = 20.0,
+                           minor_radius: float = 2.5,
+                           major_segments: int = 40,
+                           minor_segments: int = 8) -> None:
+        """Create a horizontal torus (ring) mesh lying flat in the XY plane (Z-up).
+
+        major_radius  — distance from ring centre to tube centre
+        minor_radius  — radius of the tube cross-section
+        The ring lies in the XY plane so it appears as a floor ring in Z-up scenes.
+        """
+        import math as _math
+        from pxr import UsdGeom, Gf, Vt
+
+        points = []
+        for i in range(major_segments):
+            theta = 2.0 * _math.pi * i / major_segments
+            cos_t, sin_t = _math.cos(theta), _math.sin(theta)
+            for j in range(minor_segments):
+                phi = 2.0 * _math.pi * j / minor_segments
+                cos_p, sin_p = _math.cos(phi), _math.sin(phi)
+                # XY plane ring: major circle in XY, minor cross-section in the radial+Z plane
+                r = major_radius + minor_radius * cos_p
+                x = r * cos_t
+                y = r * sin_t
+                z = minor_radius * sin_p
+                points.append(Gf.Vec3f(x, y, z))
+
+        face_counts = []
+        face_indices = []
+        for i in range(major_segments):
+            for j in range(minor_segments):
+                i0 = i * minor_segments + j
+                i1 = ((i + 1) % major_segments) * minor_segments + j
+                i2 = ((i + 1) % major_segments) * minor_segments + (j + 1) % minor_segments
+                i3 = i * minor_segments + (j + 1) % minor_segments
+                face_counts.append(4)
+                face_indices.extend([i0, i1, i2, i3])
+
+        mesh = UsdGeom.Mesh.Define(stage, path)
+        mesh.GetPointsAttr().Set(Vt.Vec3fArray(points))
+        mesh.GetFaceVertexCountsAttr().Set(Vt.IntArray(face_counts))
+        mesh.GetFaceVertexIndicesAttr().Set(Vt.IntArray(face_indices))
+        mesh.GetSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
+
     def _create_marker_prim(self, key: str, label: str, position: list, m_type: str = "navigation") -> None:
         """Writes a visible 3D geometry prim to the USD stage for a waypoint marker."""
         try:
@@ -1765,12 +1811,17 @@ class CustomMessageManager:
             prim.CreateAttribute("waypoint:cameraRotation", Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(*rot))
 
             if m_type == "navigation":
-                # Small green beacon sphere at camera position.
-                # Placed at eye-level (camera position) via saveNavMarkerHere.
-                # Kept small so it doesn't obscure the scene.
-                beacon = UsdGeom.Sphere.Define(stage, f"{marker_path}/beacon")
-                beacon.GetRadiusAttr().Set(4.0)
-                beacon.GetDisplayColorAttr().Set([Gf.Vec3f(0.46, 0.73, 0.0)])  # NVIDIA green
+                # Horizontal ring (torus) — professional navigation waypoint marker.
+                # Lies flat in the horizontal plane of the scene (Z-up: XY plane).
+                # Soft teal-white color reads as "holographic UI" rather than "debug gizmo".
+                ring_path = f"{marker_path}/nav_ring"
+                self._define_torus_mesh(stage, ring_path,
+                                        major_radius=20.0, minor_radius=2.5,
+                                        major_segments=40, minor_segments=8)
+                ring_prim = stage.GetPrimAtPath(ring_path)
+                if ring_prim and ring_prim.IsValid():
+                    mesh = UsdGeom.Mesh(ring_prim)
+                    mesh.GetDisplayColorAttr().Set([Gf.Vec3f(0.55, 0.92, 1.0)])  # soft teal-white
             else:
                 # Info markers: small glowing dot so the position is visible in the USD viewport.
                 # The primary interactive element is the 2D browser overlay badge, but this dot
