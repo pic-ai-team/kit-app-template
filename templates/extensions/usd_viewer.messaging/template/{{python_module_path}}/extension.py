@@ -16,6 +16,7 @@ from .custom_messaging import CustomMessageManager  # ADD THIS IMPORT
 from .usd_spawner import _cfg as _usd_cfg
 from .api_server import start_api_server, stop_api_server
 from .cctv_capture import get_cctv_capture
+from .robot_controller import get_robot_controller
 import omni.ext
 
 
@@ -42,6 +43,10 @@ class Extension(omni.ext.IExt):
         # Start API HTTP server (allows agent backend to capture frames directly)
         asyncio.ensure_future(start_api_server(port=8100))
 
+        # Initialize robot controller (starts update loop)
+        self._robot_controller = get_robot_controller()
+        self._robot_controller.initialize()
+
     def on_shutdown(self):
         """This is called every time the extension is deactivated. It is used to
         clean up the extension state."""
@@ -59,3 +64,7 @@ class Extension(omni.ext.IExt):
         # Stop API server and cleanup capture resources
         asyncio.ensure_future(stop_api_server())
         get_cctv_capture().shutdown()
+        # Shut down robot controller
+        if self._robot_controller:
+            self._robot_controller.shutdown()
+            self._robot_controller = None

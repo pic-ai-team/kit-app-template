@@ -18,6 +18,7 @@ from .agent_client import AgentClient, AgentAction, ChatRequest, AgentResponse
 from .camera_navigation import get_camera_navigation, CameraNavigation
 from .usd_spawner import UsdSpawner
 from .fire_incident_manager import FireIncidentManager
+from .robot_controller import RobotController, get_robot_controller
 
 
 class CustomMessageManager:
@@ -34,6 +35,7 @@ class CustomMessageManager:
         self._agent_client = AgentClient(base_url=agent_backend_url)
         self._usd_spawner = UsdSpawner()
         self._fire_manager = FireIncidentManager()
+        self._robot_controller = get_robot_controller()
         self._pending_requests: Dict[str, Dict[str, Any]] = {}  # Track pending chat requests
 
         # Camera position tracking (per session)
@@ -67,6 +69,14 @@ class CustomMessageManager:
             "fireCleared",               # Broadcast when a fire incident is extinguished
             "fireIncidentResponse",      # Direct reply to fireIncidentRequest
             "fireAdjustResponse",        # Reply to fireAdjustRequest
+            # Robot
+            "robotStatusResponse",       # Robot status (position, state, nav mesh info)
+            "robotCommandResponse",      # Ack for direct input commands
+            "robotNavPositionsResponse", # Robot nav positions list
+            "robotRoutesResponse",       # Robot routes list
+            "robotCaptureResponse",      # Robot camera snapshot thumbnail
+            "robotStatusUpdate",         # Periodic status push while moving
+            "robotGridDataResponse",     # Nav mesh grid data for visualization
         ]
 
         for message_type in outgoing_messages:
@@ -108,6 +118,18 @@ class CustomMessageManager:
             # Fire incident simulation
             'fireIncidentRequest':  self._on_fire_incident_request,
             'fireAdjustRequest':    self._on_fire_adjust_request,
+            # Robot
+            'robotCommand':             self._on_robot_command,
+            'robotNavigateToPoint':     self._on_robot_navigate_to_point,
+            'robotNavigateRoute':       self._on_robot_navigate_route,
+            'robotStop':                self._on_robot_stop,
+            'robotReset':               self._on_robot_reset,
+            'robotGetStatus':           self._on_robot_get_status,
+            'robotBuildNavMesh':        self._on_robot_build_nav_mesh,
+            'robotCaptureFrame':        self._on_robot_capture_frame,
+            'robotGetNavPositions':     self._on_robot_get_nav_positions,
+            'robotGetRoutes':           self._on_robot_get_routes,
+            'robotGetGridData':         self._on_robot_get_grid_data,
         }
 
         ed = get_eventdispatcher()
@@ -1787,6 +1809,118 @@ class CustomMessageManager:
 
     # ===== END FIRE INCIDENT SIMULATION =====
 
+    # ===== ROBOT CONTROLLER HANDLERS =====
+
+    def _init_robot(self):
+        """Lazy-initialize the robot controller and wire up status push."""
+        if not self._robot_controller:
+            self._robot_controller = get_robot_controller()
+        self._robot_controller.initialize()
+        self._robot_controller.set_on_status(self._push_robot_status)
+
+    def _push_robot_status(self, status: Dict[str, Any]):
+        """Called by RobotController on every status change — push to frontend."""
+        get_eventdispatcher().dispatch_event(
+            "robotStatusUpdate",
+            payload=status,
+        )
+
+    def _on_robot_command(self, event: carb.events.IEvent):
+        """Handle direct input commands: forward, backward, turn_left, turn_right."""
+        self._init_robot()
+        payload = event.payload
+        command = payload.get('command', '')
+        distance = float(payload.get('distance', 50.0))
+        degrees = float(payload.get('degrees', 90.0))
+
+        rc = self._robot_controller
+        if command == 'forward':
+            result = rc.move_forward(distance)
+        elif command == 'backward':
+            result = rc.move_backward(distance)
+        elif command == 'turn_left':
+            result = rc.turn_left(degrees)
+        elif command == 'turn_right':
+            result = rc.turn_right(degrees)
+        else:
+            result = {'ok': False, 'error': f'Unknown command: {command}'}
+
+        get_eventdispatcher().dispatch_event(
+            "robotCommandResponse",
+            payload=result,
+        )
+
+    def _on_robot_stop(self, event: carb.events.IEvent):
+        self._init_robot()
+        result = self._robot_controller.stop()
+        get_eventdispatcher().dispatch_event("robotCommandResponse", payload=result)
+
+    def _on_robot_reset(self, event: carb.events.IEvent):
+        self._init_robot()
+        result = self._robot_controller.reset()
+        get_eventdispatcher().dispatch_event("robotCommandResponse", payload=result)
+
+    def _on_robot_navigate_to_point(self, event: carb.events.IEvent):
+        self._init_robot()
+        payload = event.payload
+        name = payload.get('name', '')
+        result = self._robot_controller.navigate_to_point(name)
+        get_eventdispatcher().dispatch_event("robotCommandResponse", payload=result)
+
+    def _on_robot_navigate_route(self, event: carb.events.IEvent):
+        self._init_robot()
+        payload = event.payload
+        route_name = payload.get('name', '')
+        result = self._robot_controller.navigate_route(route_name)
+        get_eventdispatcher().dispatch_event("robotCommandResponse", payload=result)
+
+    def _on_robot_get_status(self, event: carb.events.IEvent):
+        self._init_robot()
+        status = self._robot_controller.get_status()
+        get_eventdispatcher().dispatch_event("robotStatusResponse", payload=status)
+
+    def _on_robot_build_nav_mesh(self, event: carb.events.IEvent):
+        self._init_robot()
+        info = self._robot_controller.build_nav_mesh()
+        get_eventdispatcher().dispatch_event("robotStatusResponse", payload={"nav_mesh": info})
+
+    def _on_robot_capture_frame(self, event: carb.events.IEvent):
+        self._init_robot()
+        payload = event.payload
+        width = int(payload.get('width', 250))
+        quality = int(payload.get('quality', 50))
+
+        async def _do():
+            result = await self._robot_controller.capture_frame(width=width, quality=quality)
+            get_eventdispatcher().dispatch_event("robotCaptureResponse", payload=result)
+
+        asyncio.ensure_future(_do())
+
+    def _on_robot_get_nav_positions(self, event: carb.events.IEvent):
+        self._init_robot()
+        self._robot_controller.reload_from_disk()
+        positions = self._robot_controller.get_nav_positions()
+        get_eventdispatcher().dispatch_event("robotNavPositionsResponse", payload={"positions": positions})
+
+    def _on_robot_get_routes(self, event: carb.events.IEvent):
+        self._init_robot()
+        self._robot_controller.reload_from_disk()
+        routes = self._robot_controller.get_routes()
+        get_eventdispatcher().dispatch_event("robotRoutesResponse", payload={"routes": routes})
+
+    def _on_robot_get_grid_data(self, event: carb.events.IEvent):
+        self._init_robot()
+        grid_data = self._robot_controller.get_grid_data()
+        if grid_data:
+            get_eventdispatcher().dispatch_event("robotGridDataResponse", payload=grid_data)
+        else:
+            get_eventdispatcher().dispatch_event(
+                "robotGridDataResponse",
+                payload={"error": "Nav mesh not built. Click Build Nav Mesh first."}
+            )
+
+    # ===== END ROBOT CONTROLLER HANDLERS =====
+
     def on_shutdown(self):
         """Clean up when the manager is shut down"""
         carb.log_info("[CustomMessageManager] Shutting down...")
@@ -1808,6 +1942,11 @@ class CustomMessageManager:
         if self._fire_manager:
             self._fire_manager.on_shutdown()
             self._fire_manager = None
+
+        # Shut down robot controller
+        if self._robot_controller:
+            self._robot_controller.shutdown()
+            self._robot_controller = None
 
         # Clean up subscriptions
         for sub in self._subscriptions:
