@@ -1815,25 +1815,16 @@ class CustomMessageManager:
             prim.CreateAttribute("waypoint:cameraRotation", Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(*rot))
 
             if m_type == "navigation":
-                # Map-pin shape: sphere head + thin vertical stem.
-                # Universally recognised as a "point of interest" marker.
-                # Deep brand blue gives strong contrast against white walls / light backgrounds.
-                # Z-up: stem runs along +Z (upward), sphere sits at the top.
-                _PIN_BLUE = [Gf.Vec3f(0.04, 0.40, 0.90)]   # deep blue
-
-                # Sphere head — sits at the beacon position (lifted by saveNavMarkerHere)
-                head = UsdGeom.Sphere.Define(stage, f"{marker_path}/pin_head")
-                head.GetRadiusAttr().Set(7.0)
-                head.GetDisplayColorAttr().Set(_PIN_BLUE)
-
-                # Thin vertical stem extending downward so the pin "points" to the floor
-                stem = UsdGeom.Cylinder.Define(stage, f"{marker_path}/pin_stem")
-                stem.GetRadiusAttr().Set(1.2)
-                stem.GetHeightAttr().Set(30.0)
-                stem.GetAxisAttr().Set("Z")
-                # Centre the stem so it starts at the sphere centre and goes down 30 units
-                UsdGeom.Xformable(stem.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(0, 0, -15))
-                stem.GetDisplayColorAttr().Set(_PIN_BLUE)
+                # Horizontal torus ring — flat, clean navigation waypoint.
+                ring_path = f"{marker_path}/nav_ring"
+                self._define_torus_mesh(stage, ring_path,
+                                        major_radius=20.0, minor_radius=2.5,
+                                        major_segments=40, minor_segments=8)
+                ring_prim = stage.GetPrimAtPath(ring_path)
+                if ring_prim and ring_prim.IsValid():
+                    UsdGeom.Mesh(ring_prim).GetDisplayColorAttr().Set(
+                        [Gf.Vec3f(0.55, 0.92, 1.0)]  # soft teal-white
+                    )
             else:
                 # Info markers: small glowing dot so the position is visible in the USD viewport.
                 # The primary interactive element is the 2D browser overlay badge, but this dot
