@@ -1743,16 +1743,19 @@ class CustomMessageManager:
             prim.CreateAttribute("waypoint:cameraRotation", Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(*rot))
 
             if m_type == "navigation":
-                # Horizontal torus ring — professional navigation waypoint.
-                ring_path = f"{marker_path}/nav_ring"
-                self._define_torus_mesh(stage, ring_path,
-                                        major_radius=20.0, minor_radius=2.5,
-                                        major_segments=40, minor_segments=8)
-                ring_prim = stage.GetPrimAtPath(ring_path)
-                if ring_prim and ring_prim.IsValid():
-                    UsdGeom.Mesh(ring_prim).GetDisplayColorAttr().Set(
-                        [Gf.Vec3f(0.55, 0.92, 1.0)]  # soft teal-white
-                    )
+                # Map-pin: sphere head + thin vertical stem.
+                _PIN_BLUE = [Gf.Vec3f(0.04, 0.40, 0.90)]
+
+                head = UsdGeom.Sphere.Define(stage, f"{marker_path}/pin_head")
+                head.GetRadiusAttr().Set(7.0)
+                head.GetDisplayColorAttr().Set(_PIN_BLUE)
+
+                stem = UsdGeom.Cylinder.Define(stage, f"{marker_path}/pin_stem")
+                stem.GetRadiusAttr().Set(1.2)
+                stem.GetHeightAttr().Set(30.0)
+                stem.GetAxisAttr().Set("Z")
+                UsdGeom.Xformable(stem.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(0, 0, -15))
+                stem.GetDisplayColorAttr().Set(_PIN_BLUE)
             else:
                 # Info markers: small glowing dot so the position is visible in the USD viewport.
                 dot = UsdGeom.Sphere.Define(stage, f"{marker_path}/info_dot")
