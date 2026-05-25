@@ -49,6 +49,8 @@ class CustomMessageManager:
         self._markers: Dict[str, Dict[str, Any]] = {}
         self._markers_file = self._resolve_markers_file()
         self._load_markers()
+        self._nav_beacon_lift: float    = 25.0
+        self._nav_forward_offset: float = 80.0
 
         # Fire incident simulation (must be created after _markers is populated)
         self._fire_manager = FireIncidentManager(self._markers)
@@ -148,6 +150,8 @@ class CustomMessageManager:
             # Joystick
             'setCameraSpeed':       self._on_set_camera_speed,
             'joystickMove':         self._on_joystick_move,
+            # Nav marker placement offsets
+            'setNavMarkerOffsets':  self._on_set_nav_marker_offsets,
         }
 
         ed = get_eventdispatcher()
@@ -1938,7 +1942,7 @@ class CustomMessageManager:
         rotation    = cam_data.get("rotation", [0.0, 0.0, 0.0])
 
         # Lift beacon above camera so the sphere never encloses the camera frustum.
-        _BEACON_LIFT = 25.0
+        _BEACON_LIFT = self._nav_beacon_lift
         try:
             import omni.usd
             from pxr import UsdGeom as _UsdGeom
@@ -1954,7 +1958,7 @@ class CustomMessageManager:
             beacon_pos[1] += _BEACON_LIFT
 
         # Push beacon forward along camera's horizontal look direction.
-        _FORWARD_OFFSET = 80.0
+        _FORWARD_OFFSET = self._nav_forward_offset
         try:
             cam_matrix = self._read_camera_view_matrix()
             if cam_matrix:
@@ -2102,6 +2106,18 @@ class CustomMessageManager:
 
         except Exception as exc:
             carb.log_warn(f"[CustomMessageManager] joystickMove error: {exc}")
+
+    def _on_set_nav_marker_offsets(self, event: carb.events.IEvent) -> None:
+        """Update lift and forward offset for new nav markers (tuneable from admin UI)."""
+        payload = getattr(event, "payload", {}) or {}
+        if "lift" in payload:
+            self._nav_beacon_lift = float(payload["lift"])
+        if "forward" in payload:
+            self._nav_forward_offset = float(payload["forward"])
+        carb.log_info(
+            f"[CustomMessageManager] Nav offsets — lift={self._nav_beacon_lift} "
+            f"forward={self._nav_forward_offset}"
+        )
 
     async def _camera_broadcast_loop(self) -> None:
         while self._camera_broadcast_running:

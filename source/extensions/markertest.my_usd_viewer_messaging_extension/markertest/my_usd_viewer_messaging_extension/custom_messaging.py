@@ -52,6 +52,9 @@ class CustomMessageManager:
         # Infographics base directory — configurable from admin panel via setInfographicsDir.
         # Falls back to infographics/ next to markers.json.
         self._infographics_dir: Optional[str] = os.environ.get("INFOGRAPHICS_DIR", "")
+        # Nav marker placement offsets — tuneable from admin UI without code changes
+        self._nav_beacon_lift: float    = 25.0   # units above camera (vertical)
+        self._nav_forward_offset: float = 80.0   # units ahead of camera (horizontal)
 
         # Fire incident simulation (must be created after _markers is populated)
         self._fire_manager = FireIncidentManager(self._markers)
@@ -146,6 +149,7 @@ class CustomMessageManager:
             'saveNavMarkerHere':       self._on_save_nav_marker_here,
             'setMarkerImage':          self._on_set_marker_image,
             'setInfographicsDir':      self._on_set_infographics_dir,
+            'setNavMarkerOffsets':     self._on_set_nav_marker_offsets,
             'startCameraBroadcast':    self._on_start_camera_broadcast,
             'stopCameraBroadcast':     self._on_stop_camera_broadcast,
             # Fire incident simulation
@@ -2015,10 +2019,7 @@ class CustomMessageManager:
         camera_pos = cam_data.get("location", [0.0, 0.0, 0.0])
         rotation    = cam_data.get("rotation", [0.0, 0.0, 0.0])
 
-        # Offset the beacon above the camera so the sphere never encloses the
-        # camera frustum (which darkens the view). 50 units is well clear of the
-        # 4-unit beacon radius; detect up-axis so it works in both Y-up and Z-up scenes.
-        _BEACON_LIFT = 25.0
+        _BEACON_LIFT = self._nav_beacon_lift
         try:
             import omni.usd
             from pxr import UsdGeom as _UsdGeom
@@ -2033,9 +2034,7 @@ class CustomMessageManager:
         else:
             beacon_pos[1] += _BEACON_LIFT   # Y-up: raise in Y
 
-        # Push the beacon forward along the camera's horizontal look direction so it
-        # appears clearly in front of the view rather than at/behind the camera origin.
-        _FORWARD_OFFSET = 80.0
+        _FORWARD_OFFSET = self._nav_forward_offset
         try:
             cam_matrix = self._read_camera_view_matrix()
             if cam_matrix:
@@ -2094,6 +2093,18 @@ class CustomMessageManager:
         get_eventdispatcher().dispatch_event(
             "infographicsDirSet",
             payload={"path": path, "ok": True},
+        )
+
+    def _on_set_nav_marker_offsets(self, event: carb.events.IEvent) -> None:
+        """Update the lift and forward offset used when saving new nav markers."""
+        payload = getattr(event, "payload", {}) or {}
+        if "lift" in payload:
+            self._nav_beacon_lift = float(payload["lift"])
+        if "forward" in payload:
+            self._nav_forward_offset = float(payload["forward"])
+        carb.log_info(
+            f"[CustomMessageManager] Nav marker offsets — lift={self._nav_beacon_lift}, "
+            f"forward={self._nav_forward_offset}"
         )
 
     def _on_set_marker_image(self, event: carb.events.IEvent) -> None:
