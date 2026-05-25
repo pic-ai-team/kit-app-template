@@ -1963,7 +1963,8 @@ class CustomMessageManager:
             cam_matrix = self._read_camera_view_matrix()
             if cam_matrix:
                 vf = cam_matrix["viewMatrix"]
-                fwd_x, fwd_y, fwd_z = -vf[8], -vf[9], -vf[10]
+                # USD row-vector: forward = -(col 2 of view) = -(vf[2], vf[6], vf[10])
+                fwd_x, fwd_y, fwd_z = -vf[2], -vf[6], -vf[10]
                 if _up == _UsdGeom.Tokens.z:
                     h0, h1 = fwd_x, fwd_y
                     length = (h0 ** 2 + h1 ** 2) ** 0.5

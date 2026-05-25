@@ -2039,10 +2039,12 @@ class CustomMessageManager:
             cam_matrix = self._read_camera_view_matrix()
             if cam_matrix:
                 vf = cam_matrix["viewMatrix"]   # row-major 4×4, world→camera
-                # Row 2 of the view matrix = camera local +Z axis in world ("back").
-                # Camera forward = -row 2.
-                fwd_x = -vf[8]
-                fwd_y = -vf[9]
+                # USD uses row-vector convention: v_cam = v_world * V.
+                # Camera forward in world = direction where camera-space Z decreases.
+                # d(lz)/d(world) = (vf[2], vf[6], vf[10])  ← column 2, not row 2.
+                # So forward = -(vf[2], vf[6], vf[10]).
+                fwd_x = -vf[2]
+                fwd_y = -vf[6]
                 fwd_z = -vf[10]
                 # Project to horizontal plane and normalise.
                 if _up == _UsdGeom.Tokens.z:
