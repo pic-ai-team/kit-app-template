@@ -1751,7 +1751,7 @@ class CustomMessageManager:
                 ring_prim = stage.GetPrimAtPath(ring_path)
                 if ring_prim and ring_prim.IsValid():
                     UsdGeom.Mesh(ring_prim).GetDisplayColorAttr().Set(
-                        [Gf.Vec3f(0.55, 0.92, 1.0)]  # soft teal-white
+                        [Gf.Vec3f(0.0, 0.70, 1.0)]  # vivid cyan-blue
                     )
             else:
                 # Info markers: small glowing dot so the position is visible in the USD viewport.
