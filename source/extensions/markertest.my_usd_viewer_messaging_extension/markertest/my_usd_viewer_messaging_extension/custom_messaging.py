@@ -93,6 +93,7 @@ class CustomMessageManager:
             "markersResponse",           # Full marker list
             "markerInfoResponse",        # AI-generated info for a clicked marker
             "markerPlaced",              # Confirmation after successful click-to-place
+            "navMarkerThumbnail",        # Zone thumbnail captured after saveNavMarkerHere
             "infographicsDirSet",        # Confirmation after setInfographicsDir
             "cameraPositionUpdate",      # Periodic camera transform broadcast for 3D projection
             # Fire incident simulation
@@ -2080,6 +2081,28 @@ class CustomMessageManager:
             "markerPlaced",
             payload={"key": key, "label": name, "type": "navigation"},
         )
+        # Capture a zone thumbnail in the background — sent as a separate event
+        # so it doesn't block the placement confirmation and doesn't inflate markersResponse.
+        asyncio.ensure_future(self._capture_zone_thumbnail(key))
+
+    async def _capture_zone_thumbnail(self, key: str) -> None:
+        """Capture a viewport thumbnail for the zone carousel card after saving a nav marker."""
+        try:
+            await asyncio.sleep(0.3)   # brief pause so the stage settles
+            frame_data = await self._viewport_capture.capture_frame_async(width=480, height=270)
+            if not frame_data:
+                return
+            thumbnail_b64 = self._compress_marker_thumbnail(frame_data, max_width=480)
+            if not thumbnail_b64:
+                return
+            data_uri = f"data:image/jpeg;base64,{thumbnail_b64}"
+            carb.log_info(f"[CustomMessageManager] Zone thumbnail captured for '{key}' ({len(thumbnail_b64)//1024} KB)")
+            get_eventdispatcher().dispatch_event(
+                "navMarkerThumbnail",
+                payload={"key": key, "thumbnail": data_uri},
+            )
+        except Exception as exc:
+            carb.log_warn(f"[CustomMessageManager] Zone thumbnail capture failed for '{key}': {exc}")
 
     def _on_set_infographics_dir(self, event: carb.events.IEvent) -> None:
         """Set the base directory where infographic images are stored."""
