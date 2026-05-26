@@ -571,10 +571,19 @@ class CameraNavigation:
 
 
         # -------- Navigation to named destination --------
-        matched_position = self.find_position(destination)
+        # Resolve exact keys first to avoid fuzzy collisions like
+        # "planogram_analysis_1" matching a position "robot_1" via shared token "1".
+        destination_key = destination.lower().strip().replace(" ", "_")
+        exact_position = destination_key in self._positions
+        exact_route = destination_key in self._routes
 
-        # Check if this destination is a route-only target (no matching position)
-        matched_route = self.find_route(destination)
+        if exact_route:
+            matched_route = destination_key
+            matched_position = destination_key if exact_position else None
+        else:
+            matched_position = self.find_position(destination)
+            matched_route = self.find_route(destination)
+
         is_route_only = matched_position is None and matched_route is not None
 
         if not matched_position and not is_route_only:
