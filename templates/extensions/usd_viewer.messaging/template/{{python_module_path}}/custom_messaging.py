@@ -1520,12 +1520,17 @@ class CustomMessageManager:
         markers_list = []
         for key, data in self._markers.items():
             raw_pos = data.get("position", [0.0, 0.0, 0.0])
-            markers_list.append({
+            entry = {
                 "key":      key,
                 "label":    data.get("label", key),
                 "position": [round(float(v), 3) for v in raw_pos],
                 "type":     data.get("type", "navigation"),
-            })
+            }
+            if entry["type"] == "navigation":
+                cam_pos = data.get("camera_position")
+                if cam_pos and len(cam_pos) == 3:
+                    entry["camera_position"] = [round(float(v), 3) for v in cam_pos]
+            markers_list.append(entry)
         get_eventdispatcher().dispatch_event(
             "markersResponse",
             payload={"markers": markers_list}
@@ -1743,16 +1748,10 @@ class CustomMessageManager:
             prim.CreateAttribute("waypoint:cameraRotation", Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(*rot))
 
             if m_type == "navigation":
-                # Horizontal torus ring — flat, clean navigation waypoint.
-                ring_path = f"{marker_path}/nav_ring"
-                self._define_torus_mesh(stage, ring_path,
-                                        major_radius=20.0, minor_radius=2.5,
-                                        major_segments=40, minor_segments=8)
-                ring_prim = stage.GetPrimAtPath(ring_path)
-                if ring_prim and ring_prim.IsValid():
-                    UsdGeom.Mesh(ring_prim).GetDisplayColorAttr().Set(
-                        [Gf.Vec3f(0.0, 0.70, 1.0)]  # vivid cyan-blue
-                    )
+                # Tiny spatial anchor dot — authoritative 3D position for radar projection.
+                anchor = UsdGeom.Sphere.Define(stage, f"{marker_path}/anchor")
+                anchor.GetRadiusAttr().Set(2.0)
+                anchor.GetDisplayColorAttr().Set([Gf.Vec3f(0.0, 0.75, 1.0)])
             else:
                 # Info markers: small glowing dot so the position is visible in the USD viewport.
                 dot = UsdGeom.Sphere.Define(stage, f"{marker_path}/info_dot")
