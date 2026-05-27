@@ -149,6 +149,7 @@ class CustomMessageManager:
             'cancelMarkerPlacement':   self._on_cancel_marker_placement,
             'saveNavMarkerHere':       self._on_save_nav_marker_here,
             'setMarkerImage':          self._on_set_marker_image,
+            'setMarkerPriority':       self._on_set_marker_priority,
             'setInfographicsDir':      self._on_set_infographics_dir,
             'setNavMarkerOffsets':     self._on_set_nav_marker_offsets,
             'startCameraBroadcast':    self._on_start_camera_broadcast,
@@ -1576,6 +1577,8 @@ class CustomMessageManager:
                 cam_pos = data.get("camera_position")
                 if cam_pos and len(cam_pos) == 3:
                     entry["camera_position"] = [round(float(v), 3) for v in cam_pos]
+                # priority: "high" | "standard" | "excluded"  (default = standard)
+                entry["priority"] = data.get("priority", "standard")
             markers_list.append(entry)
         get_eventdispatcher().dispatch_event(
             "markersResponse",
@@ -2132,6 +2135,24 @@ class CustomMessageManager:
             f"[CustomMessageManager] Nav marker offsets — lift={self._nav_beacon_lift}, "
             f"forward={self._nav_forward_offset}"
         )
+
+    def _on_set_marker_priority(self, event: carb.events.IEvent) -> None:
+        """Set the radar priority level for a navigation marker.
+        Payload: { key: str, priority: "high" | "standard" | "excluded" }
+        """
+        payload = getattr(event, "payload", {}) or {}
+        key      = payload.get("key", "").strip()
+        priority = payload.get("priority", "standard")
+        if key not in self._markers:
+            carb.log_warn(f"[CustomMessageManager] setMarkerPriority: unknown key '{key}'")
+            return
+        if priority not in ("high", "standard", "excluded"):
+            carb.log_warn(f"[CustomMessageManager] setMarkerPriority: invalid priority '{priority}'")
+            return
+        self._markers[key]["priority"] = priority
+        self._save_markers()
+        self._dispatch_markers()
+        carb.log_info(f"[CustomMessageManager] Marker '{key}' priority → {priority}")
 
     def _on_set_marker_image(self, event: carb.events.IEvent) -> None:
         """Store a local infographic filename/path for an info marker."""
