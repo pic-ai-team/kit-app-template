@@ -54,7 +54,8 @@ class CustomMessageManager:
         self._infographics_dir: Optional[str] = os.environ.get("INFOGRAPHICS_DIR", "")
         # Nav marker placement offsets — tuneable from admin UI without code changes
         self._nav_beacon_lift: float    = 25.0   # units above camera (vertical)
-        self._nav_forward_offset: float = 80.0   # units ahead of camera (horizontal)
+        self._nav_forward_offset: float = 80.0   # units ahead of camera (forward)
+        self._nav_side_offset: float    = 0.0    # units left(-) / right(+) of camera
 
         # Fire incident simulation (must be created after _markers is populated)
         self._fire_manager = FireIncidentManager(self._markers)
@@ -150,6 +151,7 @@ class CustomMessageManager:
             'saveNavMarkerHere':       self._on_save_nav_marker_here,
             'setMarkerImage':          self._on_set_marker_image,
             'setMarkerPriority':       self._on_set_marker_priority,
+            'updateMarkerPosition':    self._on_update_marker_position,
             'setInfographicsDir':      self._on_set_infographics_dir,
             'setNavMarkerOffsets':     self._on_set_nav_marker_offsets,
             'startCameraBroadcast':    self._on_start_camera_broadcast,
@@ -2040,32 +2042,37 @@ class CustomMessageManager:
             beacon_pos[1] += _BEACON_LIFT   # Y-up: raise in Y
 
         _FORWARD_OFFSET = self._nav_forward_offset
+        _SIDE_OFFSET    = self._nav_side_offset   # negative = left, positive = right
         try:
             cam_matrix = self._read_camera_view_matrix()
             if cam_matrix:
                 vf = cam_matrix["viewMatrix"]   # row-major 4×4, world→camera
-                # USD uses row-vector convention: v_cam = v_world * V.
-                # Camera forward in world = direction where camera-space Z decreases.
-                # d(lz)/d(world) = (vf[2], vf[6], vf[10])  ← column 2, not row 2.
-                # So forward = -(vf[2], vf[6], vf[10]).
-                fwd_x = -vf[2]
-                fwd_y = -vf[6]
-                fwd_z = -vf[10]
-                # Project to horizontal plane and normalise.
+                # Camera forward  = -(col 2) = -(vf[2], vf[6], vf[10])
+                # Camera right    = +(col 0) = +(vf[0], vf[4], vf[8])
+                fwd_x = -vf[2];  fwd_y = -vf[6];  fwd_z = -vf[10]
+                rgt_x =  vf[0];  rgt_y =  vf[4];  rgt_z =  vf[8]
                 if _up == _UsdGeom.Tokens.z:
-                    h0, h1 = fwd_x, fwd_y          # XY horizontal for Z-up
-                    length = (h0 ** 2 + h1 ** 2) ** 0.5
-                    if length > 1e-6:
-                        beacon_pos[0] += h0 / length * _FORWARD_OFFSET
-                        beacon_pos[1] += h1 / length * _FORWARD_OFFSET
+                    # Horizontal plane = XY; apply forward then side
+                    fwd_len = (fwd_x**2 + fwd_y**2) ** 0.5
+                    if fwd_len > 1e-6:
+                        beacon_pos[0] += fwd_x / fwd_len * _FORWARD_OFFSET
+                        beacon_pos[1] += fwd_y / fwd_len * _FORWARD_OFFSET
+                    rgt_len = (rgt_x**2 + rgt_y**2) ** 0.5
+                    if rgt_len > 1e-6:
+                        beacon_pos[0] += rgt_x / rgt_len * _SIDE_OFFSET
+                        beacon_pos[1] += rgt_y / rgt_len * _SIDE_OFFSET
                 else:
-                    h0, h1 = fwd_x, fwd_z          # XZ horizontal for Y-up
-                    length = (h0 ** 2 + h1 ** 2) ** 0.5
-                    if length > 1e-6:
-                        beacon_pos[0] += h0 / length * _FORWARD_OFFSET
-                        beacon_pos[2] += h1 / length * _FORWARD_OFFSET
+                    # Horizontal plane = XZ
+                    fwd_len = (fwd_x**2 + fwd_z**2) ** 0.5
+                    if fwd_len > 1e-6:
+                        beacon_pos[0] += fwd_x / fwd_len * _FORWARD_OFFSET
+                        beacon_pos[2] += fwd_z / fwd_len * _FORWARD_OFFSET
+                    rgt_len = (rgt_x**2 + rgt_z**2) ** 0.5
+                    if rgt_len > 1e-6:
+                        beacon_pos[0] += rgt_x / rgt_len * _SIDE_OFFSET
+                        beacon_pos[2] += rgt_z / rgt_len * _SIDE_OFFSET
         except Exception as exc:
-            carb.log_warn(f"[CustomMessageManager] Forward offset failed: {exc}")
+            carb.log_warn(f"[CustomMessageManager] Placement offset failed: {exc}")
 
         key = name.lower().replace(" ", "_")
 
@@ -2125,16 +2132,37 @@ class CustomMessageManager:
         )
 
     def _on_set_nav_marker_offsets(self, event: carb.events.IEvent) -> None:
-        """Update the lift and forward offset used when saving new nav markers."""
+        """Update lift / forward / side offsets used when saving new nav markers."""
         payload = getattr(event, "payload", {}) or {}
         if "lift" in payload:
             self._nav_beacon_lift = float(payload["lift"])
         if "forward" in payload:
             self._nav_forward_offset = float(payload["forward"])
+        if "side" in payload:
+            self._nav_side_offset = float(payload["side"])
         carb.log_info(
-            f"[CustomMessageManager] Nav marker offsets — lift={self._nav_beacon_lift}, "
-            f"forward={self._nav_forward_offset}"
+            f"[CustomMessageManager] Nav offsets — lift={self._nav_beacon_lift}, "
+            f"forward={self._nav_forward_offset}, side={self._nav_side_offset}"
         )
+
+    def _on_update_marker_position(self, event: carb.events.IEvent) -> None:
+        """Move an existing nav marker to a new position and persist.
+        Payload: { key: str, position: [x, y, z] }
+        """
+        payload = getattr(event, "payload", {}) or {}
+        key = payload.get("key", "").strip()
+        new_pos = payload.get("position")
+        if key not in self._markers or not new_pos or len(new_pos) != 3:
+            carb.log_warn(f"[CustomMessageManager] updateMarkerPosition: invalid payload for '{key}'")
+            return
+        self._markers[key]["position"] = [float(v) for v in new_pos]
+        self._save_markers()
+        # Re-create the prim at the updated position
+        label = self._markers[key].get("label", key)
+        m_type = self._markers[key].get("type", "navigation")
+        self._create_marker_prim(key, label, self._markers[key]["position"], m_type)
+        self._dispatch_markers()
+        carb.log_info(f"[CustomMessageManager] Marker '{key}' repositioned → {new_pos}")
 
     def _on_set_marker_priority(self, event: carb.events.IEvent) -> None:
         """Set the radar priority level for a navigation marker.
