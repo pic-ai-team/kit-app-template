@@ -1748,10 +1748,12 @@ class CustomMessageManager:
             prim.CreateAttribute("waypoint:cameraRotation", Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(*rot))
 
             if m_type == "navigation":
-                # Tiny spatial anchor dot — authoritative 3D position for radar projection.
+                # Invisible spatial anchor — world position only, nothing renders.
                 anchor = UsdGeom.Sphere.Define(stage, f"{marker_path}/anchor")
-                anchor.GetRadiusAttr().Set(2.0)
-                anchor.GetDisplayColorAttr().Set([Gf.Vec3f(0.0, 0.75, 1.0)])
+                anchor.GetRadiusAttr().Set(1.0)
+                UsdGeom.Imageable(anchor.GetPrim()).GetVisibilityAttr().Set(
+                    UsdGeom.Tokens.invisible
+                )
             else:
                 # Info markers: small glowing dot so the position is visible in the USD viewport.
                 dot = UsdGeom.Sphere.Define(stage, f"{marker_path}/info_dot")

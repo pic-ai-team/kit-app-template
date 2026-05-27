@@ -1820,13 +1820,14 @@ class CustomMessageManager:
             prim.CreateAttribute("waypoint:cameraRotation", Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(*rot))
 
             if m_type == "navigation":
-                # Tiny spatial anchor dot — serves as the authoritative 3D position
-                # for the browser's 2D radar projection. Not intended as a visible UI
-                # element; the 2D radar overlay (SpatialMarker) is the primary visual.
-                # Small radius keeps it unobtrusive in the RTX viewport.
+                # Invisible spatial anchor — exists only for its world-space position.
+                # The 2D radar overlay (SpatialMarker) is the visible UI element;
+                # nothing should render in the RTX viewport for nav markers.
                 anchor = UsdGeom.Sphere.Define(stage, f"{marker_path}/anchor")
-                anchor.GetRadiusAttr().Set(2.0)
-                anchor.GetDisplayColorAttr().Set([Gf.Vec3f(0.0, 0.75, 1.0)])  # cyan
+                anchor.GetRadiusAttr().Set(1.0)
+                UsdGeom.Imageable(anchor.GetPrim()).GetVisibilityAttr().Set(
+                    UsdGeom.Tokens.invisible
+                )
             else:
                 # Info markers: small glowing dot so the position is visible in the USD viewport.
                 # The primary interactive element is the 2D browser overlay badge, but this dot
