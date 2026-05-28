@@ -3,6 +3,7 @@
 
 import asyncio
 import math
+import os
 import uuid
 from typing import Dict, Any, Optional, Tuple
 
@@ -44,6 +45,14 @@ class CustomMessageManager:
         # Camera navigation for moving to store locations
         self._camera_navigation: CameraNavigation = get_camera_navigation()
 
+        # Navigation shortcuts (separate from nav positions — persisted with thumbnails)
+        self._shortcuts: Dict[str, Dict[str, Any]] = {}
+        self._shortcuts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shortcuts")
+        self._shortcuts_file = os.path.join(self._shortcuts_dir, "shortcuts.json")
+        self._shortcuts_thumbnails_dir = os.path.join(self._shortcuts_dir, "thumbnails")
+        os.makedirs(self._shortcuts_thumbnails_dir, exist_ok=True)
+        self._load_shortcuts()
+
         carb.log_info("[CustomMessageManager] Initializing...")
 
         # ===== REGISTER OUTGOING MESSAGES (Kit -> Web Client) =====
@@ -77,6 +86,10 @@ class CustomMessageManager:
             "robotCaptureResponse",      # Robot camera snapshot thumbnail
             "robotStatusUpdate",         # Periodic status push while moving
             "robotGridDataResponse",     # Nav mesh grid data for visualization
+            # Navigation shortcuts
+            "shortcutsResponse",         # Full shortcut list (after any CRUD operation)
+            "shortcutThumbnail",          # Per-shortcut thumbnail (key + base64 JPEG)
+            "shortcutClickResponse",      # Reply after clicking / navigating to a shortcut
         ]
 
         for message_type in outgoing_messages:
@@ -130,6 +143,15 @@ class CustomMessageManager:
             'robotGetNavPositions':     self._on_robot_get_nav_positions,
             'robotGetRoutes':           self._on_robot_get_routes,
             'robotGetGridData':         self._on_robot_get_grid_data,
+            # Navigation shortcuts
+            'getShortcuts':              self._on_get_shortcuts,
+            'registerShortcut':          self._on_register_shortcut,
+            'deleteShortcut':            self._on_delete_shortcut,
+            'clickShortcut':             self._on_click_shortcut,
+            'clearShortcuts':            self._on_clear_shortcuts,
+            # Joystick camera control
+            'setCameraSpeed':           self._on_set_camera_speed,
+            'joystickMove':             self._on_joystick_move,
         }
 
         ed = get_eventdispatcher()
@@ -1684,6 +1706,191 @@ class CustomMessageManager:
     # ===== END CAMERA NAV POSITION REGISTRY =====
 
     # =========================================================================
+    # NAVIGATION SHORTCUTS  (separate from nav positions — persisted with thumbnails)
+    # =========================================================================
+
+    def _load_shortcuts(self) -> None:
+        """Load shortcuts from shortcuts.json on disk."""
+        import json as _json
+        try:
+            if os.path.exists(self._shortcuts_file):
+                with open(self._shortcuts_file, "r") as f:
+                    self._shortcuts = _json.load(f)
+                carb.log_info(f"[CustomMessageManager] Loaded {len(self._shortcuts)} shortcuts")
+            else:
+                self._shortcuts = {}
+                carb.log_info("[CustomMessageManager] No shortcuts.json found, starting empty")
+        except Exception as e:
+            carb.log_warn(f"[CustomMessageManager] Failed to load shortcuts: {e}")
+            self._shortcuts = {}
+
+    def _save_shortcuts(self) -> None:
+        """Persist shortcuts dict to shortcuts.json."""
+        import json as _json
+        try:
+            with open(self._shortcuts_file, "w") as f:
+                _json.dump(self._shortcuts, f, indent=2)
+            carb.log_info(f"[CustomMessageManager] Saved {len(self._shortcuts)} shortcuts")
+        except Exception as e:
+            carb.log_error(f"[CustomMessageManager] Failed to save shortcuts: {e}")
+
+    def _dispatch_shortcuts(self, extra: dict = None) -> None:
+        """Send the full shortcut list to the web client."""
+        shortcuts_list = []
+        for key, data in self._shortcuts.items():
+            raw_pos = data.get("position", [0.0, 0.0, 0.0])
+            shortcuts_list.append({
+                "key":      key,
+                "label":    data.get("label", key),
+                "position": [round(float(v), 3) for v in raw_pos],
+                "type":     "navigation",
+            })
+        payload = {"shortcuts": shortcuts_list}
+        if extra:
+            payload.update(extra)
+        get_eventdispatcher().dispatch_event("shortcutsResponse", payload=payload)
+
+    def _dispatch_shortcut_thumbnails(self) -> None:
+        """Send cached thumbnails for all shortcuts that have one on disk."""
+        import base64 as _b64
+        for key in self._shortcuts:
+            thumb_path = os.path.join(self._shortcuts_thumbnails_dir, f"{key}.jpg")
+            if os.path.exists(thumb_path):
+                try:
+                    with open(thumb_path, "rb") as f:
+                        b64 = _b64.b64encode(f.read()).decode("utf-8")
+                    get_eventdispatcher().dispatch_event(
+                        "shortcutThumbnail",
+                        payload={"key": key, "thumbnail": b64},
+                    )
+                except Exception as e:
+                    carb.log_warn(f"[CustomMessageManager] Failed to read thumbnail for shortcut '{key}': {e}")
+
+    def _on_get_shortcuts(self, event: carb.events.IEvent) -> None:
+        carb.log_info("[CustomMessageManager] getShortcuts received")
+        self._dispatch_shortcuts()
+        # Send thumbnails as separate events (keeps each under WebRTC 64 KB limit)
+        self._dispatch_shortcut_thumbnails()
+
+    def _on_register_shortcut(self, event: carb.events.IEvent) -> None:
+        """Register a new shortcut at the provided or current camera position and capture a thumbnail."""
+        payload = event.payload or {}
+        name = payload.get("name", "").strip()
+        description = payload.get("description", name)
+        location = payload.get("location")
+        rotation = payload.get("rotation")
+
+        if not name:
+            carb.log_warn("[CustomMessageManager] registerShortcut: empty name ignored")
+            return
+
+        # Use provided position or fall back to current camera
+        if location and rotation:
+            pos = {"location": list(location), "rotation": list(rotation)}
+        else:
+            pos = self._read_camera_position_robust()
+
+        if not pos:
+            carb.log_warn("[CustomMessageManager] registerShortcut: could not determine position")
+            return
+
+        key = name.lower().replace(" ", "_")
+        self._shortcuts[key] = {
+            "label": name,
+            "description": description,
+            "position": pos["location"],
+            "rotation": pos["rotation"],
+        }
+        self._save_shortcuts()
+        carb.log_info(f"[CustomMessageManager] Registered shortcut '{key}' at {pos['location']}")
+
+        # Capture viewport thumbnail asynchronously
+        asyncio.ensure_future(self._capture_shortcut_thumbnail(key))
+
+        self._dispatch_shortcuts({"saved": True, "name": name})
+
+    async def _capture_shortcut_thumbnail(self, key: str) -> None:
+        """Capture the current viewport and save as a JPEG thumbnail for the shortcut."""
+        import base64 as _b64
+        try:
+            frame_b64 = await self._viewport_capture.capture_frame_async(width=400, height=225)
+            if not frame_b64:
+                carb.log_warn(f"[CustomMessageManager] Shortcut thumbnail capture returned no data for '{key}'")
+                return
+
+            # Compress to small JPEG
+            thumbnail_b64, _ = self._compress_planogram_frame(frame_b64)
+
+            # Save to disk
+            raw_bytes = _b64.b64decode(thumbnail_b64)
+            thumb_path = os.path.join(self._shortcuts_thumbnails_dir, f"{key}.jpg")
+            with open(thumb_path, "wb") as f:
+                f.write(raw_bytes)
+            carb.log_info(f"[CustomMessageManager] Saved shortcut thumbnail: {thumb_path} ({len(raw_bytes)} bytes)")
+
+            # Push to frontend immediately
+            get_eventdispatcher().dispatch_event(
+                "shortcutThumbnail",
+                payload={"key": key, "thumbnail": thumbnail_b64},
+            )
+        except Exception as e:
+            carb.log_error(f"[CustomMessageManager] Shortcut thumbnail capture failed for '{key}': {e}")
+
+    def _on_delete_shortcut(self, event: carb.events.IEvent) -> None:
+        key = (event.payload or {}).get("key", "").strip()
+        if key in self._shortcuts:
+            del self._shortcuts[key]
+            self._save_shortcuts()
+            # Remove thumbnail file
+            thumb_path = os.path.join(self._shortcuts_thumbnails_dir, f"{key}.jpg")
+            if os.path.exists(thumb_path):
+                os.remove(thumb_path)
+            carb.log_info(f"[CustomMessageManager] Deleted shortcut '{key}'")
+        else:
+            carb.log_warn(f"[CustomMessageManager] deleteShortcut: key '{key}' not found")
+        self._dispatch_shortcuts({"deleted": True, "key": key})
+
+    def _on_click_shortcut(self, event: carb.events.IEvent) -> None:
+        """Navigate camera to a shortcut's saved position."""
+        key = (event.payload or {}).get("key", "").strip()
+        if key not in self._shortcuts:
+            carb.log_warn(f"[CustomMessageManager] clickShortcut: key '{key}' not found")
+            return
+        shortcut = self._shortcuts[key]
+        carb.log_info(f"[CustomMessageManager] clickShortcut '{key}' — navigating")
+        asyncio.ensure_future(self._do_navigate_to_shortcut(key, shortcut))
+
+    async def _do_navigate_to_shortcut(self, key: str, shortcut: Dict[str, Any]) -> None:
+        """Navigate the camera to a shortcut and reply."""
+        label = shortcut.get("label", key)
+        position = shortcut.get("position", [0, 0, 0])
+        rotation = shortcut.get("rotation", [0, 0, 0])
+
+        nav = self._camera_navigation
+        nav_key = f"__shortcut_{key}"
+        nav.add_position(nav_key, tuple(position), tuple(rotation), label)
+        await nav.navigate_to(nav_key)
+
+        get_eventdispatcher().dispatch_event(
+            "shortcutClickResponse",
+            payload={"key": key, "label": label, "message": None, "loading": False},
+        )
+
+    def _on_clear_shortcuts(self, event: carb.events.IEvent) -> None:
+        """Delete all shortcuts and their thumbnails."""
+        # Remove thumbnail files
+        for key in self._shortcuts:
+            thumb_path = os.path.join(self._shortcuts_thumbnails_dir, f"{key}.jpg")
+            if os.path.exists(thumb_path):
+                os.remove(thumb_path)
+        self._shortcuts.clear()
+        self._save_shortcuts()
+        carb.log_info("[CustomMessageManager] Cleared all shortcuts")
+        self._dispatch_shortcuts({"cleared": True})
+
+    # ===== END NAVIGATION SHORTCUTS =====
+
+    # =========================================================================
     # FIRE INCIDENT SIMULATION
     # =========================================================================
 
@@ -1920,6 +2127,88 @@ class CustomMessageManager:
             )
 
     # ===== END ROBOT CONTROLLER HANDLERS =====
+
+    # =========================================================================
+    # JOYSTICK CAMERA CONTROL
+    # =========================================================================
+
+    def _on_set_camera_speed(self, event: carb.events.IEvent) -> None:
+        """Adjust viewport camera move speed from the browser joystick velocity slider."""
+        payload = getattr(event, "payload", {}) or {}
+        speed_level = int(payload.get("speed", 3))
+        speed_map = {1: 20.0, 2: 50.0, 3: 100.0, 4: 200.0, 5: 400.0}
+        speed_val = speed_map.get(speed_level, 100.0)
+        try:
+            import carb.settings as _cs
+            s = _cs.get_settings()
+            s.set("/persistent/app/viewport/manipulator/camera/flyAcceleration", speed_val)
+            s.set("/persistent/app/viewport/manipulator/camera/flySpeed", speed_val)
+            carb.log_info(f"[CustomMessageManager] Camera speed set to level {speed_level} ({speed_val})")
+        except Exception as exc:
+            carb.log_warn(f"[CustomMessageManager] setCameraSpeed failed: {exc}")
+
+    def _on_joystick_move(self, event: carb.events.IEvent) -> None:
+        """Move camera in the horizontal floor plane from browser joystick.
+
+        dy < 0 = forward; dx > 0 = strafe right.
+        Handles both Y-up (floor=XZ) and Z-up (floor=XY) scenes automatically.
+        """
+        payload = getattr(event, "payload", {}) or {}
+        dx = float(payload.get("dx", 0.0))
+        dy = float(payload.get("dy", 0.0))
+        velocity = int(payload.get("velocity", 3))
+        if abs(dx) < 0.05 and abs(dy) < 0.05:
+            return
+
+        speed_map = {1: 2.0, 2: 5.0, 3: 10.0, 4: 20.0, 5: 35.0}
+        speed = speed_map.get(velocity, 10.0)
+
+        try:
+            import omni.usd
+            from pxr import UsdGeom, Gf, Usd
+
+            stage = omni.usd.get_context().get_stage()
+            if not stage:
+                return
+
+            up_axis = UsdGeom.GetStageUpAxis(stage)
+            z_up = (up_axis == UsdGeom.Tokens.z)
+
+            result = self._camera_navigation._get_camera_and_ops()
+            if result is None:
+                return
+            xformable, translate_op, _ = result
+            if translate_op is None:
+                return
+
+            world_xform = xformable.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            look_w  = world_xform.TransformDir(Gf.Vec3d(0, 0, -1))
+            right_w = world_xform.TransformDir(Gf.Vec3d(1, 0, 0))
+
+            if z_up:
+                fwd   = Gf.Vec3d(look_w[0],  look_w[1],  0.0)
+                right = Gf.Vec3d(right_w[0], right_w[1], 0.0)
+            else:
+                fwd   = Gf.Vec3d(look_w[0],  0.0, look_w[2])
+                right = Gf.Vec3d(right_w[0], 0.0, right_w[2])
+
+            if fwd.GetLength() < 1e-6 or right.GetLength() < 1e-6:
+                return
+            fwd   = fwd.GetNormalized()
+            right = right.GetNormalized()
+
+            cur   = translate_op.Get()
+            delta = fwd * (-dy * speed) + right * (dx * speed)
+
+            if z_up:
+                translate_op.Set(Gf.Vec3d(cur[0] + delta[0], cur[1] + delta[1], cur[2]))
+            else:
+                translate_op.Set(Gf.Vec3d(cur[0] + delta[0], cur[1], cur[2] + delta[2]))
+
+        except Exception as exc:
+            carb.log_warn(f"[CustomMessageManager] joystickMove error: {exc}")
+
+    # ===== END JOYSTICK CAMERA CONTROL =====
 
     def on_shutdown(self):
         """Clean up when the manager is shut down"""
