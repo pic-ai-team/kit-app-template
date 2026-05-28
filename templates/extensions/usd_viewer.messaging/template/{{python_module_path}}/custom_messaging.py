@@ -152,6 +152,7 @@ class CustomMessageManager:
             # Joystick camera control
             'setCameraSpeed':           self._on_set_camera_speed,
             'joystickMove':             self._on_joystick_move,
+            'joystickLook':             self._on_joystick_look,
         }
 
         ed = get_eventdispatcher()
@@ -2207,6 +2208,57 @@ class CustomMessageManager:
 
         except Exception as exc:
             carb.log_warn(f"[CustomMessageManager] joystickMove error: {exc}")
+
+    def _on_joystick_look(self, event: carb.events.IEvent) -> None:
+        """Rotate camera from browser look-joystick (touch & drag event on screen with tablet).
+
+        dx > 0 = look right (yaw);  dy > 0 = look down (pitch).
+        Handles both Y-up and Z-up scenes automatically.
+        """
+        payload = getattr(event, "payload", {}) or {}
+        dx = float(payload.get("dx", 0.0))
+        dy = float(payload.get("dy", 0.0))
+        sensitivity = int(payload.get("sensitivity", 3))
+        if abs(dx) < 0.05 and abs(dy) < 0.05:
+            return
+
+        speed_map = {1: 0.4, 2: 0.8, 3: 1.5, 4: 2.5, 5: 4.0}
+        deg_per_tick = speed_map.get(sensitivity, 1.5)
+
+        try:
+            import omni.usd
+            from pxr import UsdGeom, Gf
+
+            result = self._camera_navigation._get_camera_and_ops()
+            if result is None:
+                return
+            _, _, rotate_op = result
+            if rotate_op is None:
+                return
+
+            stage = omni.usd.get_context().get_stage()
+            up_axis = UsdGeom.GetStageUpAxis(stage) if stage else UsdGeom.Tokens.z
+            z_up = (up_axis == UsdGeom.Tokens.z)
+
+            cur = rotate_op.Get()
+            rx, ry, rz = float(cur[0]), float(cur[1]), float(cur[2])
+
+            d_pitch = -dy * deg_per_tick   # up on stick = look up = negative pitch
+            d_yaw   = -dx * deg_per_tick   # right on stick = look right
+
+            rx += d_pitch
+            # Clamp pitch to avoid flipping
+            rx = max(0.0, min(150.0, rx))
+
+            if z_up:
+                rz += d_yaw
+            else:
+                ry += d_yaw
+
+            rotate_op.Set(Gf.Vec3f(rx, ry, rz))
+
+        except Exception as exc:
+            carb.log_warn(f"[CustomMessageManager] joystickLook error: {exc}")
 
     # ===== END JOYSTICK CAMERA CONTROL =====
 
