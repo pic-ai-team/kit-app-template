@@ -19,7 +19,7 @@ from .agent_client import AgentClient, AgentAction, ChatRequest, AgentResponse
 from .camera_navigation import get_camera_navigation, CameraNavigation
 from .usd_spawner import UsdSpawner
 from .fire_incident_manager import FireIncidentManager
-from .robot_controller import RobotController, get_robot_controller
+from .robots.robot_controller import RobotController, get_robot_controller
 
 
 class CustomMessageManager:

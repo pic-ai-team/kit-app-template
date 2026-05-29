@@ -20,8 +20,6 @@ from typing import Dict, Any, List, Optional
 import carb
 import omni.kit.app
 
-# Prefix used to identify CCTV positions within the nav positions system
-CCTV_PREFIX = "cctv_"
 
 # Resolution for CCTV captures
 CCTV_WIDTH = 1920
@@ -30,133 +28,108 @@ CCTV_HEIGHT = 1080
 
 class CCTVCapture:
     """
-    Captures frames from all registered CCTV positions using a dedicated
-    off-screen HydraTexture render product. The user's viewport camera is
-    never moved.
+    Captures frames from all real camera prims under /World/_dstore/CCTV_Cameras/*/Camera
+    using a dedicated off-screen HydraTexture render product.
     """
 
-    CCTV_CAMERA_PATH = "/World/CCTV_Camera"
+    CCTV_CAMERA_ROOT = "/World/_dstore/CCTV_Cameras"
 
     def __init__(self):
-        self._camera_created = False
         self._hydra_texture = None
         self._drawable_sub = None
         self._hydra_size = (CCTV_WIDTH, CCTV_HEIGHT)
-        # Capture coordination: set by _capture_single_frame, consumed by _on_drawable_changed
         self._capture_state = None  # {"future": asyncio.Future, "skip": int}
 
 
-    # ------------------------------------------------------------------
-    # CCTV position registry
-    # ------------------------------------------------------------------
-
-    def _get_cctv_positions(self) -> Dict[str, Dict[str, Any]]:
-        """Get all positions whose key starts with 'cctv_'."""
-        from .camera_navigation import get_camera_navigation
-
-        nav = get_camera_navigation()
-        all_positions = nav.get_positions()
-        return {
-            k: v for k, v in all_positions.items()
-            if k.startswith(CCTV_PREFIX)
-        }
-
-
-    # ------------------------------------------------------------------
-    # USD camera prim
-    # ------------------------------------------------------------------
-
-    def _ensure_cctv_camera(self):
-        """Create the dedicated CCTV camera prim if it doesn't exist."""
-        if self._camera_created:
-            return True
-
+    def _get_camera_prims(self) -> List[dict]:
+        """
+        Enumerate all camera prims under CCTV_CAMERA_ROOT/*/Camera.
+        Returns a list of dicts: {"prim_path", "camera_name", "camera_id", "location"}
+        Adds debug logging for troubleshooting.
+        """
         try:
             import omni.usd
-            from pxr import UsdGeom
+            from pxr import Usd, UsdGeom, Sdf
 
             stage = omni.usd.get_context().get_stage()
             if not stage:
                 carb.log_error("[CCTVCapture] No USD stage available")
-                return False
+                return []
 
-            prim = stage.GetPrimAtPath(self.CCTV_CAMERA_PATH)
-            if not prim or not prim.IsValid():
-                camera = UsdGeom.Camera.Define(stage, self.CCTV_CAMERA_PATH)
-                camera.GetFocalLengthAttr().Set(18.14)
-                camera.GetHorizontalApertureAttr().Set(20.955)
-                camera.GetVerticalApertureAttr().Set(15.2908)
-                camera.GetClippingRangeAttr().Set((1.0, 10000000.0))
-                carb.log_info(f"[CCTVCapture] Created CCTV camera at {self.CCTV_CAMERA_PATH}")
+            camera_infos = []
+            root_prim = stage.GetPrimAtPath(self.CCTV_CAMERA_ROOT)
+            if not root_prim or not root_prim.IsValid():
+                carb.log_warn(f"[CCTVCapture] CCTV camera root {self.CCTV_CAMERA_ROOT} not found")
+                return []
 
-            self._camera_created = True
-            return True
+            carb.log_info(f"[CCTVCapture] Children of {self.CCTV_CAMERA_ROOT}:")
+            for child in root_prim.GetChildren():
+                carb.log_info(f"  - {child.GetPath().pathString} type={child.GetTypeName()} isXform={child.IsA(UsdGeom.Xform)}")
+                if not child.IsA(UsdGeom.Xform):
+                    continue
+                xform_prim = child
+                name_attr = xform_prim.GetAttribute("camera_name")
+                id_attr = xform_prim.GetAttribute("camera_id")
+                camera_name = None
+                camera_id = None
+                if name_attr and name_attr.HasAuthoredValue():
+                    camera_name = name_attr.Get()
+                if id_attr and id_attr.HasAuthoredValue():
+                    camera_id = id_attr.Get()
+                # Fallback logic for camera_id
+                if not camera_id:
+                    if camera_name:
+                        camera_id = camera_name.lower().replace(' ', '_')
+                    else:
+                        camera_id = xform_prim.GetName()
+                # Fallback logic for camera_name
+                if not camera_name:
+                    camera_name = xform_prim.GetName()
 
+                cam_found = False
+                for cam_child in xform_prim.GetChildren():
+                    carb.log_info(f"    - child {cam_child.GetPath().pathString} type={cam_child.GetTypeName()}")
+                    if cam_child.GetTypeName() == "Camera":
+                        cam_found = True
+                        try:
+                            xform = UsdGeom.Xformable(cam_child)
+                            world_xf = xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                            translation = world_xf.ExtractTranslation()
+                            location = [float(translation[0]), float(translation[1]), float(translation[2])]
+                        except Exception as e:
+                            carb.log_warn(f"[CCTVCapture] Failed to get world location for {cam_child.GetPath().pathString}: {e}")
+                            location = [0, 0, 0]
+                        camera_infos.append({
+                            "prim_path": cam_child.GetPath().pathString,
+                            "camera_name": camera_name,
+                            "camera_id": camera_id,
+                            "location": location
+                        })
+                if not cam_found:
+                    carb.log_warn(f"[CCTVCapture] No Camera child found under {xform_prim.GetPath().pathString}")
+            carb.log_info(f"[CCTVCapture] Found {len(camera_infos)} camera prim(s) under CCTV root")
+            return camera_infos
         except Exception as e:
-            carb.log_error(f"[CCTVCapture] Failed to create CCTV camera: {e}")
-            return False
+            carb.log_error(f"[CCTVCapture] Error enumerating camera prims: {e}")
+            return []
 
 
-    def _set_cctv_camera_pose(self, location: List[float], rotation: List[float]):
-        """Teleport the CCTV camera to the given pose."""
-        try:
-            import omni.usd
-            from pxr import UsdGeom, Gf
-
-            stage = omni.usd.get_context().get_stage()
-            prim = stage.GetPrimAtPath(self.CCTV_CAMERA_PATH)
-            if not prim or not prim.IsValid():
-                carb.log_error("[CCTVCapture] CCTV camera prim not found")
-                return False
-
-            xformable = UsdGeom.Xformable(prim)
-
-            translate_op = None
-            rotate_op = None
-            for op in xformable.GetOrderedXformOps():
-                op_name = op.GetOpName()
-                if op_name == "xformOp:translate":
-                    translate_op = op
-                elif "rotate" in op_name.lower():
-                    rotate_op = op
-
-            if translate_op is None or rotate_op is None:
-                xformable.SetXformOpOrder([])
-                translate_op = xformable.AddTranslateOp()
-                rotate_op = xformable.AddRotateXYZOp()
-
-            tx, ty, tz = location
-            rx, ry, rz = rotation
-            translate_op.Set(Gf.Vec3d(tx, ty, tz))
-            rotate_op.Set(Gf.Vec3f(rx, ry, rz))
-            return True
-
-        except Exception as e:
-            carb.log_error(f"[CCTVCapture] Failed to set camera pose: {e}")
-            return False
+    # No prim creation or pose logic needed anymore
 
 
     # ------------------------------------------------------------------
     # Headless HydraTexture + event subscription
     # ------------------------------------------------------------------
 
-    def _ensure_hydra_texture(self, width: int = CCTV_WIDTH, height: int = CCTV_HEIGHT) -> bool:
-        """Create the off-screen HydraTexture and subscribe to its events."""
+    def _ensure_hydra_texture(self, camera_prim_path: str, width: int = CCTV_WIDTH, height: int = CCTV_HEIGHT) -> bool:
+        """Create the off-screen HydraTexture for a specific camera prim and subscribe to its events."""
         width = max(64, int(width))
         height = max(64, int(height))
         requested_size = (width, height)
 
-        if self._hydra_texture is not None and self._hydra_size == requested_size:
-            return True
-
-        # Recreate texture if resolution changed
-        if self._hydra_texture is not None and self._hydra_size != requested_size:
-            carb.log_info(
-                f"[CCTVCapture] Recreating HydraTexture due to size change "
-                f"{self._hydra_size[0]}x{self._hydra_size[1]} -> {width}x{height}"
-            )
-            self._drawable_sub = None
-            self._hydra_texture = None
+        # Always recreate for each camera
+        self._drawable_sub = None
+        self._hydra_texture = None
 
         try:
             from omni.kit.hydra_texture import create_hydra_texture, GLOBAL_EVENT_DRAWABLE_CHANGED
@@ -167,18 +140,17 @@ class CCTVCapture:
                 width=width,
                 height=height,
                 usd_context_name="",
-                usd_camera_path=self.CCTV_CAMERA_PATH,
+                usd_camera_path=camera_prim_path,
                 hydra_engine_name="rtx",
                 is_async=True,
             )
             if ht is None:
-                carb.log_error("[CCTVCapture] create_hydra_texture returned None")
+                carb.log_error(f"[CCTVCapture] create_hydra_texture returned None for {camera_prim_path}")
                 return False
 
             self._hydra_texture = ht
             self._hydra_size = requested_size
 
-            # Subscribe to frame-ready events from THIS specific HydraTexture
             self._drawable_sub = get_eventdispatcher().observe_event(
                 observer_name="cctv_capture_drawable",
                 event_name=GLOBAL_EVENT_DRAWABLE_CHANGED,
@@ -186,17 +158,14 @@ class CCTVCapture:
                 filter=ht.get_event_key(),
             )
 
-            carb.log_info(
-                f"[CCTVCapture] Created off-screen HydraTexture "
-                f"{width}x{height} + event subscription"
-            )
+            carb.log_info(f"[CCTVCapture] Created off-screen HydraTexture {width}x{height} for {camera_prim_path}")
             return True
 
         except ImportError as e:
             carb.log_error(f"[CCTVCapture] Import error creating HydraTexture: {e}")
             return False
         except Exception as e:
-            carb.log_error(f"[CCTVCapture] Failed to create HydraTexture: {e}")
+            carb.log_error(f"[CCTVCapture] Failed to create HydraTexture for {camera_prim_path}: {e}")
             import traceback
             carb.log_error(traceback.format_exc())
             return False
@@ -313,87 +282,30 @@ class CCTVCapture:
 
     async def _capture_single_frame(self) -> Optional[str]:
         """
-        Request a single frame capture from the off-screen HydraTexture.
-        Waits for the drawable changed event to fire and deliver pixels.
+        Not used in new logic. Use _capture_single_frame_for_camera instead.
         """
+        return None
+
+    async def _capture_single_frame_for_camera(self, camera_prim_path: str) -> Optional[str]:
+        """
+        Request a single frame capture from the off-screen HydraTexture for a specific camera prim.
+        """
+        if not self._ensure_hydra_texture(camera_prim_path):
+            return None
+        await asyncio.sleep(0.1)  # Let USD propagate
         loop = asyncio.get_event_loop()
         future = loop.create_future()
-
-        # Skip 3 rendered frames to let the new camera pose propagate
         self._capture_state = {"future": future, "skip": 3}
-
         try:
             result = await asyncio.wait_for(future, timeout=15.0)
             return result
         except asyncio.TimeoutError:
-            carb.log_warn("[CCTVCapture] Frame capture timed out (15s)")
+            carb.log_warn(f"[CCTVCapture] Frame capture timed out (15s) for {camera_prim_path}")
             return None
         finally:
             self._capture_state = None
 
-    # ------------------------------------------------------------------
-    # Active viewport fallback
-    # ------------------------------------------------------------------
-
-    async def _capture_via_active_viewport(self) -> Optional[str]:
-        """
-        Fallback: capture from the active viewport by temporarily switching
-        its camera. Causes a brief visual glitch on the WebRTC stream.
-        """
-        try:
-            from omni.kit.viewport.utility import (
-                get_active_viewport,
-                capture_viewport_to_buffer,
-                next_viewport_frame_async,
-            )
-
-            viewport = get_active_viewport()
-            if viewport is None:
-                carb.log_error("[CCTVCapture] No active viewport for fallback capture")
-                return None
-
-            await next_viewport_frame_async(viewport)
-            await next_viewport_frame_async(viewport)
-
-            loop = asyncio.get_event_loop()
-            future = loop.create_future()
-
-            def on_capture(buffer, buffer_size, w, h, fmt):
-                try:
-                    if buffer is None or buffer_size <= 0:
-                        if not future.done():
-                            future.set_result(None)
-                        return
-                    import ctypes
-                    btype = type(buffer).__name__
-                    if btype == 'PyCapsule':
-                        ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
-                        ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
-                        ptr = ctypes.pythonapi.PyCapsule_GetPointer(buffer, None)
-                        data = ctypes.string_at(ptr, buffer_size) if ptr else None
-                    elif isinstance(buffer, (bytes, bytearray)):
-                        data = bytes(buffer)
-                    elif isinstance(buffer, int):
-                        data = ctypes.string_at(buffer, buffer_size)
-                    else:
-                        data = bytes(memoryview(buffer))
-                    b64 = self._raw_to_base64_jpeg(data, w, h, fmt) if data else None
-                    if not future.done():
-                        future.set_result(b64)
-                except Exception as e:
-                    carb.log_error(f"[CCTVCapture] Fallback callback error: {e}")
-                    if not future.done():
-                        future.set_result(None)
-
-            capture_viewport_to_buffer(viewport, on_capture)
-            return await asyncio.wait_for(future, timeout=10.0)
-
-        except asyncio.TimeoutError:
-            carb.log_warn("[CCTVCapture] Fallback capture timed out")
-            return None
-        except Exception as e:
-            carb.log_warn(f"[CCTVCapture] Fallback capture failed: {e}")
-            return None
+    # No viewport fallback anymore
 
 
     # ------------------------------------------------------------------
@@ -445,79 +357,30 @@ class CCTVCapture:
 
     async def capture_all_feeds(self) -> List[Dict[str, Any]]:
         """
-        Cycle through all CCTV positions and capture a frame from each.
-
-        Tries the off-screen HydraTexture first (zero visual impact).
-        Falls back to the active viewport approach if HydraTexture fails.
+        Iterate over all real camera prims and capture a frame from each.
+        Returns a list of dicts: {"camera_name", "camera_id", "prim_path", "location", "frame_data"}
         """
-        positions = self._get_cctv_positions()
-        if not positions:
-            carb.log_warn("[CCTVCapture] No CCTV positions registered (prefix 'cctv_')")
+        cameras = self._get_camera_prims()
+        if not cameras:
+            carb.log_warn("[CCTVCapture] No camera prims found under CCTV root")
             return []
 
-        carb.log_info(f"[CCTVCapture] Starting capture for {len(positions)} position(s)")
-
-        if not self._ensure_cctv_camera():
-            carb.log_warn("[CCTVCapture] Failed to ensure CCTV camera")
-            return []
-
-        # Try to set up the off-screen render path
-        use_hydra = self._ensure_hydra_texture()
-        if use_hydra:
-            carb.log_info("[CCTVCapture] Using off-screen HydraTexture (no visual impact)")
-        else:
-            carb.log_info("[CCTVCapture] Falling back to active viewport (brief visual glitch)")
-
-        # For fallback: save & restore original camera
-        original_camera = None
-        viewport = None
-        if not use_hydra:
-            from omni.kit.viewport.utility import get_active_viewport
-            viewport = get_active_viewport()
-            if viewport is None:
-                carb.log_warn("[CCTVCapture] No active viewport — cannot capture")
-                return []
-            original_camera = viewport.camera_path
-            viewport.camera_path = self.CCTV_CAMERA_PATH
-
+        carb.log_info(f"[CCTVCapture] Starting capture for {len(cameras)} camera(s)")
         results: List[Dict[str, Any]] = []
-
-        try:
-            for cam_id, pos_data in positions.items():
-                location = pos_data.get("location", [0, 0, 0])
-                rotation = pos_data.get("rotation", [0, 0, 0])
-                description = pos_data.get("description", cam_id)
-
-                if not self._set_cctv_camera_pose(location, rotation):
-                    carb.log_warn(f"[CCTVCapture] Skipping {cam_id} — pose set failed")
-                    continue
-
-                # Small delay to let USD propagation begin
-                await asyncio.sleep(0.1)
-
-                if use_hydra:
-                    frame_data = await self._capture_single_frame()
-                else:
-                    frame_data = await self._capture_via_active_viewport()
-
-                if frame_data:
-                    results.append({
-                        "camera_id": cam_id,
-                        "frame_data": frame_data,
-                        "location": location,
-                        "rotation": rotation,
-                        "description": description,
-                    })
-                    carb.log_warn(f"[CCTVCapture] Captured {cam_id}")
-                else:
-                    carb.log_warn(f"[CCTVCapture] Failed to capture {cam_id}")
-
-        finally:
-            if not use_hydra and viewport is not None and original_camera is not None:
-                viewport.camera_path = original_camera
-                carb.log_warn(f"[CCTVCapture] Restored camera to {original_camera}")
-
-        carb.log_warn(f"[CCTVCapture] Captured {len(results)}/{len(positions)} CCTV feeds")
+        for cam in cameras:
+            frame_data = await self._capture_single_frame_for_camera(cam["prim_path"])
+            if frame_data:
+                results.append({
+                    "camera_name": cam["camera_name"],
+                    "camera_id": cam["camera_id"],
+                    "prim_path": cam["prim_path"],
+                    "location": cam["location"],
+                    "frame_data": frame_data
+                })
+                carb.log_info(f"[CCTVCapture] Captured {cam['camera_name']} ({cam['prim_path']})")
+            else:
+                carb.log_warn(f"[CCTVCapture] Failed to capture {cam['camera_name']} ({cam['prim_path']})")
+        carb.log_info(f"[CCTVCapture] Captured {len(results)}/{len(cameras)} camera feeds")
         return results
 
 
@@ -528,27 +391,10 @@ class CCTVCapture:
     def shutdown(self):
         """Clean up render targets and camera resources."""
         try:
-            # Unsubscribe from events
             self._drawable_sub = None
             self._capture_state = None
-
-            # Drop HydraTexture reference
             self._hydra_texture = None
             self._hydra_size = (CCTV_WIDTH, CCTV_HEIGHT)
-
-            # Remove the CCTV camera prim
-            if self._camera_created:
-                try:
-                    import omni.usd
-                    stage = omni.usd.get_context().get_stage()
-                    if stage:
-                        prim = stage.GetPrimAtPath(self.CCTV_CAMERA_PATH)
-                        if prim and prim.IsValid():
-                            stage.RemovePrim(self.CCTV_CAMERA_PATH)
-                except Exception:
-                    pass
-                self._camera_created = False
-
             carb.log_info("[CCTVCapture] Shutdown complete")
         except Exception as e:
             carb.log_warn(f"[CCTVCapture] Shutdown error: {e}")

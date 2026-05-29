@@ -37,11 +37,7 @@ DEFAULT_TURN_SPEED = 90.0    # deg/s
 _FALLBACK_DT = 1.0 / 60.0
 
 # Robot prim path in the stage
-ROBOT_PRIM_PATH = "/World/Robots/create_3"
-
-# Height offset for the robot camera "eye" above the robot origin
-ROBOT_CAMERA_HEIGHT = 50.0   # cm above robot origin
-ROBOT_CAMERA_FORWARD = 0.0  # cm in front of robot origin
+ROBOT_PRIM_PATH = "/World/Robots/service_robotV1"
 
 
 class DriveState(Enum):
@@ -192,8 +188,8 @@ class RobotDriveController:
             return True
 
         # Lazy-init nav mesh
-        if self._nav_mesh is None:
-            self._nav_mesh = get_robot_nav_mesh()
+        if self._nav_mesh is None:  
+            self._nav_mesh = get_robot_nav_mesh(cell_size=10.0, robot_radius=50.0)
         if not self._nav_mesh.is_built:
             carb.log_warn("[RobotDrive] Nav mesh not built — driving direct")
             self._queue_direct_drive(cur_x, cur_y, cur_yaw, x, y, target_yaw)
@@ -306,42 +302,6 @@ class RobotDriveController:
         except Exception as e:
             carb.log_error(f"[RobotDrive] get_position failed: {e}")
             return None
-
-    def get_camera_world_pos(self) -> Optional[Tuple[float, float, float, float]]:
-        """
-        Return the virtual camera position above the robot:
-        (x, y, z, yaw_degrees).
-
-        The camera is placed at camera_height above (Z-up) and
-        ROBOT_CAMERA_FORWARD in front of the robot origin.
-        camera_height is read from the ``camera_height_cm`` custom attribute
-        on the robot prim; falls back to ROBOT_CAMERA_HEIGHT.
-        """
-        pos = self.get_position()
-        if pos is None:
-            return None
-        x, y, z, yaw = pos
-
-        # Read camera height from robot prim attribute if available
-        cam_height = ROBOT_CAMERA_HEIGHT
-        try:
-            import omni.usd
-            stage = omni.usd.get_context().get_stage()
-            if stage:
-                prim = stage.GetPrimAtPath(self._robot_path)
-                if prim and prim.IsValid():
-                    attr = prim.GetAttribute("camera_height_cm")
-                    if attr and attr.HasValue():
-                        cam_height = float(attr.Get())
-        except Exception:
-            pass
-
-        # Model forward = +X at rz 0, matching atan2 convention
-        rad = math.radians(yaw)
-        cam_x = x + ROBOT_CAMERA_FORWARD * math.cos(rad)
-        cam_y = y + ROBOT_CAMERA_FORWARD * math.sin(rad)
-        cam_z = z + cam_height
-        return (cam_x, cam_y, cam_z, yaw)
 
     def _get_xform_ops(self):
         """Get translate and rotateY ops for the robot, creating if needed."""

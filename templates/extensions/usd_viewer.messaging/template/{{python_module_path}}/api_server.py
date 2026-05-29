@@ -92,39 +92,37 @@ class APIServer:
         return web.json_response({"status": "ok", "service": "kit-cctv"})
 
     async def _handle_positions(self, request):
-        """Return all registered CCTV positions."""
+        """Return all real CCTV camera prims with camera_name, camera_id, and location."""
         from aiohttp import web
         from .cctv_capture import get_cctv_capture
 
         capture = get_cctv_capture()
-        positions = capture._get_cctv_positions()
-
+        cameras = capture._get_camera_prims()
         return web.json_response({
-            "positions": {
-                k: {
-                    "location": v.get("location", [0, 0, 0]),
-                    "rotation": v.get("rotation", [0, 0, 0]),
-                    "description": v.get("description", k),
+            "positions": [
+                {
+                    "camera_name": cam["camera_name"],
+                    "camera_id": cam["camera_id"],
+                    "prim_path": cam["prim_path"],
+                    "location": cam["location"]
                 }
-                for k, v in positions.items()
-            },
-            "count": len(positions),
+                for cam in cameras
+            ],
+            "count": len(cameras),
         })
 
     async def _handle_capture(self, request):
         """
-        Capture frames from all CCTV positions.
+        Capture frames from all real CCTV camera prims.
 
         Query params:
             cameras (optional): Comma-separated camera IDs to capture.
-                                If omitted, captures ALL cctv_ positions.
+                                If omitted, captures ALL cameras.
 
         Returns JSON:
             {
                 "feeds": [
-                    {"camera_id": "cctv_entrance", "frame_data": "<base64>",
-                     "location": [...], "rotation": [...], "description": "..."},
-                    ...
+                    {"camera_name": ..., "camera_id": ..., "prim_path": ..., "location": [...], "frame_data": "<base64>"}, ...
                 ],
                 "count": N
             }

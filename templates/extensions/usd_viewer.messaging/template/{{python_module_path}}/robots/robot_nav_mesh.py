@@ -483,7 +483,7 @@ _nav_mesh: Optional[RobotNavMesh] = None
 
 def get_robot_nav_mesh(
     cell_size: float = 10.0,
-    robot_radius: float = 30.0,
+    robot_radius: float = 50.0,
 ) -> RobotNavMesh:
     """Get or create the singleton navigation mesh."""
     global _nav_mesh

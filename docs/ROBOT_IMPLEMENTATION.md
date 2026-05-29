@@ -138,12 +138,10 @@ controller.stop()
 ### 3. `robot_camera.py` — Virtual Camera
 
 **How it works:**
-1. Creates a dedicated `/World/Robot_Camera` USD camera prim (hidden from the user's viewport)
-2. Computes the robot's "eye" position using `camera_height_cm` custom attribute on the robot xForm (falls back to `ROBOT_CAMERA_HEIGHT` = 50 cm) + `ROBOT_CAMERA_FORWARD` in front
-3. Camera rotation uses `rotateXYZ(80, 0, yaw - 90)`: after the 80° X rotation the camera looks along +Y, so subtracting 90° aligns it with the robot's forward direction (+X at yaw=0)
-4. Uses **HydraTexture** off-screen rendering (same pattern as `cctv_capture.py`) — no viewport disruption
-5. Reads pixels via `omni.renderer_capture` from the `LdrColor` AOV
-6. Downscales to a JPEG thumbnail (250px wide, quality 50)
+1. Uses the camera prim inside the robot asset
+2. Uses **HydraTexture** off-screen rendering (same pattern as `cctv_capture.py`) — no viewport disruption
+3. Reads pixels via `omni.renderer_capture` from the `LdrColor` AOV
+4. Downscales to a JPEG thumbnail (250px wide, quality 50)
 
 ### 4. `robot_controller.py` — Orchestrator
 
