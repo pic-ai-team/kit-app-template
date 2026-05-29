@@ -399,22 +399,92 @@ class RobotNavMesh:
         return None, None
 
     def _simplify_path(self, path: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """Remove intermediate collinear waypoints (axis-aligned segments)."""
+        """Collapse A* staircase segments into clean L-shaped turns.
+
+        Instead of many tiny axis-aligned zigzags, finds the farthest point
+        reachable via an L-shape (drive X then Y, or Y then X) where both
+        legs are fully obstacle-free.  Result: the robot makes a small number
+        of 90° turns instead of dozens of staircase steps.
+        """
         if len(path) <= 2:
             return path
 
-        simplified = [path[0]]
-        for i in range(1, len(path) - 1):
-            px, py = path[i - 1]
-            cx, cy = path[i]
-            nx, ny = path[i + 1]
-            # Keep point if direction changes
-            dx1, dy1 = cx - px, cy - py
-            dx2, dy2 = nx - cx, ny - cy
-            if (dx1, dy1) != (dx2, dy2):
-                simplified.append(path[i])
-        simplified.append(path[-1])
-        return simplified
+        smoothed = [path[0]]
+        anchor = 0
+
+        while anchor < len(path) - 1:
+            # Greedily find the farthest point reachable via an L-shape
+            best = anchor + 1
+            best_corner = None
+
+            for candidate in range(len(path) - 1, anchor + 1, -1):
+                corner = self._find_l_shape(path[anchor], path[candidate])
+                if corner is not None:
+                    best = candidate
+                    best_corner = corner
+                    break
+
+            if best_corner is not None:
+                ax, ay = path[anchor]
+                cx, cy = best_corner
+                bx, by = path[best]
+                # Only insert corner if it's actually a turn (not collinear)
+                if not (abs(cx - ax) < 0.01 and abs(cx - bx) < 0.01) and \
+                   not (abs(cy - ay) < 0.01 and abs(cy - by) < 0.01):
+                    smoothed.append(best_corner)
+            smoothed.append(path[best])
+            anchor = best
+
+        return smoothed
+
+    def _find_l_shape(
+        self, p1: Tuple[float, float], p2: Tuple[float, float]
+    ) -> Optional[Tuple[float, float]]:
+        """Check if p1→p2 is reachable via an L-shaped axis-aligned path.
+
+        Tries two options:
+          A) Go X first: p1 → (p2.x, p1.y) → p2
+          B) Go Y first: p1 → (p1.x, p2.y) → p2
+
+        Returns the corner point if either option has both legs free,
+        or None if neither works.  Prefers the option with shorter total
+        distance (they're equal for L-shapes, so prefer whichever is free).
+        """
+        x1, y1 = p1
+        x2, y2 = p2
+
+        # Option A: X first, then Y — corner at (x2, y1)
+        corner_a = (x2, y1)
+        if self._axis_line_free(x1, y1, x2, y1) and self._axis_line_free(x2, y1, x2, y2):
+            return corner_a
+
+        # Option B: Y first, then X — corner at (x1, y2)
+        corner_b = (x1, y2)
+        if self._axis_line_free(x1, y1, x1, y2) and self._axis_line_free(x1, y2, x2, y2):
+            return corner_b
+
+        return None
+
+    def _axis_line_free(
+        self, x1: float, y1: float, x2: float, y2: float
+    ) -> bool:
+        """Check if an axis-aligned line between two world points is obstacle-free."""
+        c1, r1 = self.world_to_grid(x1, y1)
+        c2, r2 = self.world_to_grid(x2, y2)
+
+        if c1 == c2:
+            # Vertical line (same column, varying row)
+            lo, hi = (min(r1, r2), max(r1, r2))
+            for r in range(lo, hi + 1):
+                if not self.is_free(c1, r):
+                    return False
+        else:
+            # Horizontal line (same row, varying column)
+            lo, hi = (min(c1, c2), max(c1, c2))
+            for c in range(lo, hi + 1):
+                if not self.is_free(c, r1):
+                    return False
+        return True
 
     # ------------------------------------------------------------------
     # Debug / introspection
