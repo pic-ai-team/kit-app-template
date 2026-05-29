@@ -28,8 +28,9 @@ class APIServer:
     Endpoints:
         GET  /cctv/capture               — capture all CCTV feeds (returns JSON with base64 frames)
         GET  /cctv/positions             — list registered CCTV positions
-        GET  /planogram/shelf-analysis   — run automatic shelf analysis along a route
+        GET  /robot/shelf-analysis       — run automatic shelf analysis along a robot route
                                            (returns per-rack stock data)
+        GET  /robot/shelf-analysis/routes — list available robot shelf analysis routes
         GET  /health                     — simple health check
     """
 
@@ -57,7 +58,8 @@ class APIServer:
         app = web.Application()
         app.router.add_get("/cctv/capture", self._handle_capture)
         app.router.add_get("/cctv/positions", self._handle_positions)
-        app.router.add_get("/planogram/shelf-analysis", self._handle_shelf_analysis)
+        app.router.add_get("/robot/shelf-analysis", self._handle_shelf_analysis)
+        app.router.add_get("/robot/shelf-analysis/routes", self._handle_shelf_analysis_routes)
         app.router.add_get("/health", self._handle_health)
 
         self._runner = web.AppRunner(app)
@@ -157,44 +159,20 @@ class APIServer:
 
     async def _handle_shelf_analysis(self, request):
         """
-        Run automatic shelf analysis along a planogram route.
+        Run automatic shelf analysis using the service robot.
+
+        The robot navigates to each waypoint in the specified route, captures
+        a high-resolution frame from its on-board camera, identifies products
+        via the vision backend, and computes per-rack stock levels. The robot
+        returns to its initial position after the analysis is complete.
 
         Query params:
-            route (required): Name of the planogram route to follow.
+            route (required): Name of a robot_shelf_analysis_* route.
             tolerance_cm (optional): Row clustering tolerance (default 8.0).
             model (optional): Vision model — "qwen" (default) or "cosmos".
 
         Returns JSON with per-rack analysis including rack_id, rack_name,
         stock_level, shelf_levels with product stock ratios.
-
-        Example success response:
-            {
-                "success": true,
-                "route": "route_name",
-                "waypoint_count": 4,
-                "results": [
-                    {
-                        "rack_id": "Rack_6B",
-                        "rack_name": "Snacks Rack 6B",
-                        "waypoint_count": 2,
-                        "stock_level": 0.85,
-                        "stock": 85,
-                        "initial_stock": 100,
-                        "asset_keys": ["doritos_nacho", "lays_classic"],
-                        "shelf_levels": [
-                            {
-                                "level": 1,
-                                "floor_z": 114.0,
-                                "shelf_stock_level": 1.0,
-                                "products": {
-                                    "doritos_nacho": {"stock": 9, "initial_stock": 9},
-                                    "lays_classic": {"stock": 6, "initial_stock": 6}
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
         """
         from aiohttp import web
 
@@ -209,7 +187,6 @@ class APIServer:
         model = request.query.get("model", "qwen")
 
         try:
-            import omni.kit.app
             mgr = None
             try:
                 from . import custom_messaging as _cm_mod
@@ -228,10 +205,11 @@ class APIServer:
                 route, {"tolerance_cm": tolerance_cm, "model": model}
             )
 
-            # _run_automatic_shelf_analysis returns {} on errors (dispatches
-            # the error via WebRTC internally). Translate to proper HTTP status.
             if not result or not result.get("success"):
-                error_msg = result.get("error", "Analysis produced no results") if result else "Analysis returned empty"
+                error_msg = (
+                    result.get("error", "Analysis produced no results")
+                    if result else "Analysis returned empty"
+                )
                 return web.json_response(
                     {"success": False, "error": error_msg},
                     status=422,
@@ -245,6 +223,57 @@ class APIServer:
             carb.log_error(traceback.format_exc())
             return web.json_response(
                 {"success": False, "error": str(e)},
+                status=500,
+            )
+
+    async def _handle_shelf_analysis_routes(self, request):
+        """
+        List available robot shelf analysis routes.
+
+        Returns JSON:
+            {
+                "routes": {
+                    "robot_shelf_analysis_snacks": {"waypoints": [...]},
+                    ...
+                },
+                "count": N
+            }
+        """
+        from aiohttp import web
+
+        try:
+            mgr = None
+            try:
+                from . import custom_messaging as _cm_mod
+                mgr = getattr(_cm_mod, '_manager_instance', None)
+            except Exception:
+                pass
+
+            if mgr is None:
+                return web.json_response(
+                    {"error": "CustomMessageManager not available", "routes": {}, "count": 0},
+                    status=503,
+                )
+
+            # Initialize robot controller and reload routes from disk
+            mgr._init_robot()
+            mgr._robot_controller.reload_from_disk()
+            routes = mgr._robot_controller.get_shelf_analysis_routes()
+
+            return web.json_response({
+                "routes": {
+                    name: {"waypoint_count": len(data.get("waypoints", []))}
+                    for name, data in routes.items()
+                },
+                "count": len(routes),
+            })
+
+        except Exception as e:
+            carb.log_error(f"[APIServer] Shelf analysis routes error: {e}")
+            import traceback
+            carb.log_error(traceback.format_exc())
+            return web.json_response(
+                {"error": str(e), "routes": {}, "count": 0},
                 status=500,
             )
 

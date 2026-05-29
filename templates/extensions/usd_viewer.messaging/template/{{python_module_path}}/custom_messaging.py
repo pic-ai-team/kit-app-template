@@ -1120,9 +1120,9 @@ class CustomMessageManager:
 
         return shelf_levels
 
-    # ===== AUTOMATIC SHELF ANALYSIS (route-based) =====
+    # ===== AUTOMATIC SHELF ANALYSIS (robot route-based) =====
 
-    PLANOGRAM_ROUTE_PREFIX = "planogram_analysis_"
+    SHELF_ANALYSIS_ROUTE_PREFIX = "robot_shelf_analysis_"
 
     def _on_automatic_shelf_analysis_request(self, event: carb.events.IEvent):
         """Handle automaticShelfAnalysisRequest — run shelf analysis along a route."""
@@ -1138,29 +1138,35 @@ class CustomMessageManager:
 
     async def _run_automatic_shelf_analysis(self, route_name: str, payload: dict) -> dict:
         """
-        Automated shelf stock analysis along a planogram route.
+        Automated shelf stock analysis using the service robot.
 
-        For each waypoint in the route:
-        1. Teleport hidden camera to waypoint position
-        2. Capture a frame
+        The robot physically navigates to each waypoint in the route,
+        captures a high-resolution frame from its on-board camera, and
+        sends it to the vision backend for product identification.
+
+        For each waypoint:
+        1. Navigate robot to waypoint and wait for arrival
+        2. Capture high-res frame from robot camera (2000x2000, Q90)
         3. POST to /api/identify-shelf-products → asset_keys + product_info + rack
         4. Run row detection per product (reuse _merge_shelf_levels)
         5. Compute stock ratios using initial_stock from product_info
 
-        After all waypoints: merge results that share the same rack (majority
-        vote on rack_id) and deduplicate products across merged waypoints.
+        After all waypoints: merge results that share the same rack and
+        return the robot to its initial position.
 
-        Returns list of per-rack analysis results dispatched via
+        Returns per-rack analysis results dispatched via
         automaticShelfAnalysisResponse.
         """
         import json as _json
         import urllib.request as _urllib
-        from .cctv_capture import get_cctv_capture
 
         tolerance = float(payload.get("tolerance_cm", 8.0))
         model = payload.get("model", "qwen")
-        capture_width = int(payload.get("capture_width", 1920))
-        capture_height = int(payload.get("capture_height", 1080))
+
+        # Robot camera resolution — frame for shelf analysis
+        cam_width = int(payload.get("capture_width", 2000))
+        cam_height = int(payload.get("capture_height", 2000))
+        cam_quality = int(payload.get("capture_quality", 90))
 
         def _err(msg: str):
             get_eventdispatcher().dispatch_event(
@@ -1169,60 +1175,76 @@ class CustomMessageManager:
             )
             return {"success": False, "error": msg}
 
-        # Get route waypoints
-        route_data = self._camera_navigation.get_all_routes().get(route_name)
+        # Initialize robot controller
+        self._init_robot()
+        rc = self._robot_controller
+        rc.reload_from_disk()
+
+        # Resolve route from robot routes (robot_shelf_analysis_* prefix)
+        route_key = route_name.lower().strip().replace(" ", "_")
+        routes = rc.get_routes()
+        route_data = routes.get(route_key)
         if not route_data:
-            return _err(f"Route '{route_name}' not found")
+            return _err(f"Route '{route_name}' not found in robot routes")
 
         waypoints = route_data.get("waypoints", [])
         if not waypoints:
             return _err(f"Route '{route_name}' has no waypoints")
 
-        carb.log_info(f"[AutoShelfAnalysis] Starting analysis on route '{route_name}' with {len(waypoints)} waypoint(s)")
-
-        # Use the CCTV capture infrastructure for the hidden camera
-        cctv = get_cctv_capture()
-        if not cctv._ensure_cctv_camera():
-            return _err("Failed to create hidden camera")
-        use_hydra = cctv._ensure_hydra_texture(width=capture_width, height=capture_height)
         carb.log_info(
-            f"[AutoShelfAnalysis] Capture settings: hydra={use_hydra} "
-            f"requested={capture_width}x{capture_height}"
+            f"[AutoShelfAnalysis] Starting robot-based analysis on route '{route_name}' "
+            f"with {len(waypoints)} waypoint(s), camera {cam_width}x{cam_height}"
         )
 
+        # Build nav mesh if not already built
+        if rc._nav_mesh and not rc._nav_mesh.is_built:
+            rc.build_nav_mesh()
+
         backend = self._agent_client._base_url
+
+        # Save robot start position so we can navigate back (not teleport)
+        start_pos = rc._drive.get_position()  # (x, y, z, yaw)
 
         # Collect per-waypoint raw results before merging
         wp_raw_results = []
 
         for wp_idx, wp in enumerate(waypoints):
             location = wp.get("location", [0, 0, 0])
-            rotation = wp.get("rotation", [0, 0, 0])
+            yaw = wp.get("yaw", None)
 
-            carb.log_info(f"[AutoShelfAnalysis] Waypoint {wp_idx + 1}/{len(waypoints)} at {location}")
+            carb.log_info(
+                f"[AutoShelfAnalysis] Waypoint {wp_idx + 1}/{len(waypoints)} "
+                f"at ({location[0]:.0f}, {location[1]:.0f}), yaw={yaw}"
+            )
 
-            # 1. Teleport hidden camera
-            if not cctv._set_cctv_camera_pose(location, rotation):
-                carb.log_warn(f"[AutoShelfAnalysis] Skipping waypoint {wp_idx + 1} — pose set failed")
+            # 1. Navigate robot to waypoint and wait for arrival
+            arrived = await rc.navigate_to_and_wait(
+                location[0], location[1], target_yaw=yaw, timeout=120.0
+            )
+            if not arrived:
+                carb.log_warn(
+                    f"[AutoShelfAnalysis] Robot failed to reach waypoint {wp_idx + 1} — skipping"
+                )
                 continue
 
-            await asyncio.sleep(0.15)
+            # Brief settle time for rendering after arrival
+            await asyncio.sleep(0.5)
 
-            # 2. Capture frame
-            if use_hydra:
-                frame_b64 = await cctv._capture_single_frame()
-            else:
-                frame_b64 = await cctv._capture_via_active_viewport()
+            # 2. Capture high-res frame from robot camera
+            result = await rc.capture_frame_full_res(
+                width=cam_width, height=cam_height, quality=cam_quality
+            )
+            frame_b64 = result.get("frame") if result.get("ok") else None
 
             if not frame_b64:
-                carb.log_warn(f"[AutoShelfAnalysis] Skipping waypoint {wp_idx + 1} — capture failed")
+                carb.log_warn(
+                    f"[AutoShelfAnalysis] Capture failed at waypoint {wp_idx + 1} — skipping"
+                )
                 continue
-
-            vision_b64 = frame_b64
 
             # 3. Identify products via backend (enriched endpoint)
             url = f"{backend}/api/identify-shelf-products"
-            body = _json.dumps({"frame_data": vision_b64, "model": model}).encode("utf-8")
+            body = _json.dumps({"frame_data": frame_b64, "model": model}).encode("utf-8")
             try:
                 loop = asyncio.get_event_loop()
                 resp = await loop.run_in_executor(
@@ -1237,7 +1259,9 @@ class CustomMessageManager:
                     ),
                 )
             except Exception as exc:
-                carb.log_error(f"[AutoShelfAnalysis] identify-shelf-products failed at wp{wp_idx + 1}: {exc}")
+                carb.log_error(
+                    f"[AutoShelfAnalysis] identify-shelf-products failed at wp{wp_idx + 1}: {exc}"
+                )
                 continue
 
             asset_keys = resp.get("products", [])
@@ -1257,13 +1281,14 @@ class CustomMessageManager:
                     all_rows[key] = result["rows"]
 
             if not all_rows:
-                carb.log_warn(f"[AutoShelfAnalysis] No shelf rows detected at waypoint {wp_idx + 1}")
+                carb.log_warn(
+                    f"[AutoShelfAnalysis] No shelf rows detected at waypoint {wp_idx + 1}"
+                )
                 continue
 
             wp_raw_results.append({
                 "waypoint": wp_idx + 1,
                 "location": location,
-                "rotation": rotation,
                 "rack_id": rack_id,
                 "rack_name": rack_name,
                 "all_rows": all_rows,
@@ -1271,38 +1296,43 @@ class CustomMessageManager:
                 "asset_keys": asset_keys,
             })
 
+        # Navigate robot back to where it started (smooth drive, not teleport)
+        if start_pos:
+            carb.log_info(
+                f"[AutoShelfAnalysis] Analysis complete — navigating robot back to "
+                f"({start_pos[0]:.0f}, {start_pos[1]:.0f})"
+            )
+            await rc.navigate_to_and_wait(
+                start_pos[0], start_pos[1],
+                target_yaw=start_pos[3],
+                timeout=120.0,
+            )
+        else:
+            carb.log_warn("[AutoShelfAnalysis] Could not read start position — skipping return")
+
         if not wp_raw_results:
             return _err("No waypoints produced results")
 
         # ── Merge waypoints by rack_id ──────────────────────────────────────
-        # Group waypoints by rack_id. Products seen in multiple waypoints for
-        # the same rack are deduplicated (same asset_key = same product).
-        rack_groups: dict = {}  # rack_id → list of wp_raw dicts
+        rack_groups: dict = {}
         for wp_raw in wp_raw_results:
             rid = wp_raw["rack_id"] or "unknown"
             rack_groups.setdefault(rid, []).append(wp_raw)
 
         results = []
         for rid, group in rack_groups.items():
-            # Rack name: use the name from the first waypoint
             rack_name = group[0]["rack_name"]
 
-            # Merge all_rows across waypoints, deduplicating by asset_key.
-            # Same asset_key in multiple waypoints = same products (no double-count).
-            # We take the union: for each product, keep the entry with the highest count.
             merged_rows: dict = {}
             merged_product_info: dict = {}
             for wp_raw in group:
                 for key, rows in wp_raw["all_rows"].items():
                     if key not in merged_rows:
                         merged_rows[key] = rows
-                    # else: already counted — skip duplicate
                 merged_product_info.update(wp_raw["product_info"])
 
-            # Merge into unified shelf levels
             shelf_levels = self._merge_shelf_levels(merged_rows, tolerance)
 
-            # Compute stock ratios
             product_shelf_count: dict = {}
             for lv in shelf_levels:
                 for key in lv.get("products", {}):
@@ -1319,7 +1349,10 @@ class CustomMessageManager:
                     info = merged_product_info.get(key, {})
                     product_init_stock = info.get("initial_stock", 0) or 0
                     num_shelves = product_shelf_count.get(key, 1)
-                    shelf_init_stock = round(product_init_stock / num_shelves) if num_shelves > 0 else 0
+                    shelf_init_stock = (
+                        round(product_init_stock / num_shelves)
+                        if num_shelves > 0 else 0
+                    )
 
                     prod_data["stock"] = current_count
                     prod_data["initial_stock"] = shelf_init_stock
@@ -1329,7 +1362,9 @@ class CustomMessageManager:
                     shelf_stock += current_count
                     shelf_init += shelf_init_stock
 
-                lv["shelf_stock_level"] = round(shelf_stock / shelf_init, 2) if shelf_init > 0 else 0.0
+                lv["shelf_stock_level"] = (
+                    round(shelf_stock / shelf_init, 2) if shelf_init > 0 else 0.0
+                )
                 total_stock += shelf_stock
                 total_initial_stock += shelf_init
 
@@ -1338,7 +1373,10 @@ class CustomMessageManager:
                 "rack_name": rack_name,
                 "waypoint_count": len(group),
                 "products": list(merged_rows.keys()),
-                "stock_level": round(total_stock / total_initial_stock, 2) if total_initial_stock > 0 else 0.0,
+                "stock_level": (
+                    round(total_stock / total_initial_stock, 2)
+                    if total_initial_stock > 0 else 0.0
+                ),
                 "stock": total_stock,
                 "initial_stock": total_initial_stock,
                 "shelf_levels": shelf_levels,
@@ -1361,8 +1399,16 @@ class CustomMessageManager:
                 "results": results,
             },
         )
-        carb.log_info(f"[AutoShelfAnalysis] Completed: {len(results)} racks from {len(wp_raw_results)} waypoints")
-        return {"success": True, "results": results}
+        carb.log_info(
+            f"[AutoShelfAnalysis] Completed: {len(results)} racks "
+            f"from {len(wp_raw_results)} waypoints"
+        )
+        return {
+            "success": True,
+            "route": route_name,
+            "waypoint_count": len(waypoints),
+            "results": results,
+        }
 
     # ===== CAMERA NAV POSITION REGISTRY =====
 
