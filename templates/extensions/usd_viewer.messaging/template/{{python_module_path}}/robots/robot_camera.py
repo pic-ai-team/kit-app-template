@@ -12,116 +12,52 @@ The camera pose is derived from the robot prim's position + its
 import asyncio
 import base64
 import io
-import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import carb
 
 from .robot_drive_controller import (
-    ROBOT_CAMERA_FORWARD,
-    ROBOT_CAMERA_HEIGHT,
-    get_robot_drive_controller,
+    ROBOT_PRIM_PATH,
 )
 
 # Resolution for robot camera captures
-ROBOT_CAM_WIDTH = 640
-ROBOT_CAM_HEIGHT = 480
+ROBOT_CAM_WIDTH = 250
+ROBOT_CAM_HEIGHT = 1000
 
 
 class RobotCamera:
     """Captures a snapshot from the robot's virtual camera viewpoint."""
 
-    ROBOT_CAMERA_PATH = "/World/Robot_Camera"
+    ROBOT_CAMERA_PATH = ROBOT_PRIM_PATH + "/Camera"
 
     def __init__(self):
         self._capturing = False
-        self._camera_created = False
         self._hydra_texture = None
         self._drawable_sub = None
         self._hydra_size = (ROBOT_CAM_WIDTH, ROBOT_CAM_HEIGHT)
         self._capture_state = None  # {"future": asyncio.Future, "skip": int}
 
-    def get_eye_position(self) -> Optional[Tuple[float, float, float, float]]:
-        """
-        Return (x, y, z, yaw) for the robot camera.
-        Uses the drive controller's helper.
-        """
-        ctrl = get_robot_drive_controller()
-        return ctrl.get_camera_world_pos()
-
     # ------------------------------------------------------------------
     # USD camera prim
     # ------------------------------------------------------------------
-
-    def _ensure_robot_camera(self) -> bool:
-        """Create the dedicated Robot_Camera prim if it doesn't exist."""
-        if self._camera_created:
-            return True
+    def _is_robot_camera(self) -> bool:
+        """Check if the camera prim exists, and throw error if not."""
         try:
             import omni.usd
-            from pxr import UsdGeom
 
             stage = omni.usd.get_context().get_stage()
-            if not stage:
-                carb.log_error("[RobotCamera] No USD stage available")
+            if stage is None:
+                carb.log_error("[RobotCamera] USD stage not available")
                 return False
 
             prim = stage.GetPrimAtPath(self.ROBOT_CAMERA_PATH)
-            if not prim or not prim.IsValid():
-                camera = UsdGeom.Camera.Define(stage, self.ROBOT_CAMERA_PATH)
-                camera.GetFocalLengthAttr().Set(18.14)
-                camera.GetHorizontalApertureAttr().Set(20.955)
-                camera.GetVerticalApertureAttr().Set(15.2908)
-                camera.GetClippingRangeAttr().Set((1.0, 10000000.0))
-                carb.log_info(f"[RobotCamera] Created camera at {self.ROBOT_CAMERA_PATH}")
-
-            self._camera_created = True
-            return True
-        except Exception as e:
-            carb.log_error(f"[RobotCamera] Failed to create camera: {e}")
-            return False
-
-    def _set_robot_camera_pose(self) -> bool:
-        """Teleport the Robot_Camera to the robot's eye-point."""
-        eye = self.get_eye_position()
-        if eye is None:
-            return False
-        cam_x, cam_y, cam_z, yaw = eye
-
-        try:
-            import omni.usd
-            from pxr import UsdGeom, Gf
-
-            stage = omni.usd.get_context().get_stage()
-            prim = stage.GetPrimAtPath(self.ROBOT_CAMERA_PATH)
-            if not prim or not prim.IsValid():
+            if prim and prim.IsValid():
+                return True
+            else:
+                carb.log_error(f"[RobotCamera] Camera prim at {self.ROBOT_CAMERA_PATH} is invalid")
                 return False
-
-            xformable = UsdGeom.Xformable(prim)
-
-            translate_op = None
-            rotate_op = None
-            for op in xformable.GetOrderedXformOps():
-                op_name = op.GetOpName()
-                if op_name == "xformOp:translate":
-                    translate_op = op
-                elif "rotate" in op_name.lower():
-                    rotate_op = op
-
-            if translate_op is None or rotate_op is None:
-                xformable.SetXformOpOrder([])
-                translate_op = xformable.AddTranslateOp()
-                rotate_op = xformable.AddRotateXYZOp()
-
-            translate_op.Set(Gf.Vec3d(cam_x, cam_y, cam_z))
-            # Z-up store: rx=80 tilts the camera to look nearly horizontal.
-            # After 80° X-rotation the camera looks along +Y, but the robot
-            # model faces +X at rz=0.  Subtracting 90° aligns the camera
-            # with the robot's actual forward direction.
-            rotate_op.Set(Gf.Vec3f(80.0, 0.0, yaw - 90.0))
-            return True
         except Exception as e:
-            carb.log_error(f"[RobotCamera] Failed to set camera pose: {e}")
+            carb.log_error(f"[RobotCamera] Error accessing USD stage when checking robot camera prim: {e}")
             return False
 
     # ------------------------------------------------------------------
@@ -284,15 +220,13 @@ class RobotCamera:
             self._capturing = False
 
     async def _do_capture(self, width: int, quality: int) -> Optional[str]:
-        if not self._ensure_robot_camera():
-            return None
-        if not self._set_robot_camera_pose():
+        if not self._is_robot_camera():
             return None
 
         use_hydra = self._ensure_hydra_texture()
         if not use_hydra:
-            carb.log_warn("[RobotCamera] HydraTexture unavailable, falling back to viewport")
-            return await self._capture_via_viewport(width, quality)
+            carb.log_warn("[RobotCamera] HydraTexture unavailable")
+            return None
 
         # Wait briefly for USD pose propagation
         await asyncio.sleep(0.1)
@@ -313,69 +247,6 @@ class RobotCamera:
             return None
 
         return _make_thumbnail(frame_b64, width, quality)
-
-    async def _capture_via_viewport(self, width: int, quality: int) -> Optional[str]:
-        """Fallback: capture from active viewport (brief visual glitch)."""
-        try:
-            from omni.kit.viewport.utility import (
-                get_active_viewport,
-                capture_viewport_to_buffer,
-                next_viewport_frame_async,
-            )
-
-            viewport = get_active_viewport()
-            if viewport is None:
-                return None
-
-            # Save & switch camera
-            original_camera = viewport.camera_path
-            viewport.camera_path = self.ROBOT_CAMERA_PATH
-
-            await next_viewport_frame_async(viewport)
-            await next_viewport_frame_async(viewport)
-
-            loop = asyncio.get_event_loop()
-            future = loop.create_future()
-
-            def on_capture(buffer, buffer_size, w, h, fmt):
-                try:
-                    if buffer is None or buffer_size <= 0:
-                        if not future.done():
-                            future.set_result(None)
-                        return
-                    import ctypes
-                    btype = type(buffer).__name__
-                    if btype == 'PyCapsule':
-                        ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
-                        ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
-                        ptr = ctypes.pythonapi.PyCapsule_GetPointer(buffer, None)
-                        data = ctypes.string_at(ptr, buffer_size) if ptr else None
-                    elif isinstance(buffer, (bytes, bytearray)):
-                        data = bytes(buffer)
-                    elif isinstance(buffer, int):
-                        data = ctypes.string_at(buffer, buffer_size)
-                    else:
-                        data = bytes(memoryview(buffer))
-                    b64 = _raw_to_base64_jpeg(data, w, h, fmt) if data else None
-                    if not future.done():
-                        future.set_result(b64)
-                except Exception as e:
-                    carb.log_error(f"[RobotCamera] Fallback callback error: {e}")
-                    if not future.done():
-                        future.set_result(None)
-
-            capture_viewport_to_buffer(viewport, on_capture)
-            result = await asyncio.wait_for(future, timeout=10.0)
-
-            # Restore original camera
-            viewport.camera_path = original_camera
-
-            if result:
-                return _make_thumbnail(result, width, quality)
-            return None
-        except Exception as e:
-            carb.log_warn(f"[RobotCamera] Fallback capture failed: {e}")
-            return None
 
     # ------------------------------------------------------------------
     # Cleanup

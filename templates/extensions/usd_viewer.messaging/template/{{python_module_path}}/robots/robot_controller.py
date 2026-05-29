@@ -18,8 +18,7 @@ The ``rotation`` field ``[rx, ry, rz]`` stores Euler XYZ; ``rz`` is
 the yaw (rotation around Z in the Z-up store).
 """
 
-import asyncio
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 import carb
 
@@ -27,7 +26,6 @@ from .robot_nav_mesh import RobotNavMesh, get_robot_nav_mesh
 from .robot_drive_controller import (
     RobotDriveController,
     get_robot_drive_controller,
-    ROBOT_PRIM_PATH,
 )
 from .robot_camera import RobotCamera, get_robot_camera
 
@@ -77,7 +75,7 @@ class RobotController:
         carb.log_info("[RobotController] Initializing...")
 
         # Nav mesh
-        self._nav_mesh = get_robot_nav_mesh(cell_size=10.0, robot_radius=30.0)
+        self._nav_mesh = get_robot_nav_mesh(cell_size=10.0, robot_radius=50.0)
         # Build is deferred until the stage is loaded — see build_nav_mesh()
 
         # Drive controller
@@ -104,7 +102,7 @@ class RobotController:
         Returns grid info dict.
         """
         if self._nav_mesh is None:
-            self._nav_mesh = get_robot_nav_mesh()
+            self._nav_mesh = get_robot_nav_mesh(cell_size=10.0, robot_radius=50.0)
 
         ok = self._nav_mesh.build_from_stage()
         info = self._nav_mesh.get_grid_info()
@@ -272,14 +270,6 @@ class RobotController:
             return {"ok": True, "frame": frame}
         return {"ok": False, "error": "Capture failed"}
 
-    def get_camera_position(self) -> Dict[str, Any]:
-        """Return the robot camera's virtual world position."""
-        self._ensure_initialized()
-        pos = self._camera.get_eye_position()
-        if pos:
-            return {"ok": True, "position": list(pos[:3]), "yaw": pos[3]}
-        return {"ok": False, "error": "Cannot determine camera position"}
-
     # ------------------------------------------------------------------
     # Robot status
     # ------------------------------------------------------------------
@@ -290,7 +280,6 @@ class RobotController:
             return {"initialized": False}
 
         pos = self._drive.get_position()
-        cam = self._drive.get_camera_world_pos()
         return {
             "initialized": True,
             "state": self._drive.state_name,
@@ -298,7 +287,6 @@ class RobotController:
             "queue_length": self._drive.queue_length,
             "position": list(pos[:3]) if pos else None,
             "yaw": pos[3] if pos else None,
-            "camera_position": list(cam[:3]) if cam else None,
             "nav_mesh_built": self._nav_mesh.is_built if self._nav_mesh else False,
         }
 
@@ -312,7 +300,7 @@ class RobotController:
     def reload_from_disk(self) -> None:
         """Reload nav positions and routes from disk (picks up external changes)."""
         try:
-            from .camera_navigation import get_camera_navigation
+            from ..camera_navigation import get_camera_navigation
             nav = get_camera_navigation()
             # Reload the underlying camera navigation JSON files
             nav._load_custom_positions()
@@ -333,7 +321,7 @@ class RobotController:
     def _load_nav_positions(self) -> None:
         """Load robot_* entries from the shared nav_presets.json."""
         try:
-            from .camera_navigation import get_camera_navigation
+            from ..camera_navigation import get_camera_navigation
             nav = get_camera_navigation()
             all_positions = nav.get_positions()
             self._nav_positions = {}
@@ -366,7 +354,7 @@ class RobotController:
     def _load_routes(self) -> None:
         """Load robot_* entries from the shared nav_routes.json."""
         try:
-            from .camera_navigation import get_camera_navigation
+            from ..camera_navigation import get_camera_navigation
             nav = get_camera_navigation()
             all_routes = nav.get_all_routes()
             self._routes = {}

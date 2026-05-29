@@ -1,0 +1,7 @@
+{
+    "create_3": {
+        "robot_name": "Cleaning Robot",
+        "prim_name": "create_3",
+        "prim_path": "/World/Robots/create_3"
+    }
+}

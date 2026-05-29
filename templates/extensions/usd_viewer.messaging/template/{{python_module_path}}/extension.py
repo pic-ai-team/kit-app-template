@@ -16,7 +16,7 @@ from .custom_messaging import CustomMessageManager  # ADD THIS IMPORT
 from .usd_spawner import _cfg as _usd_cfg
 from .api_server import start_api_server, stop_api_server
 from .cctv_capture import get_cctv_capture
-from .robot_controller import get_robot_controller
+from .robots.robot_controller import get_robot_controller
 import omni.ext
 
 
