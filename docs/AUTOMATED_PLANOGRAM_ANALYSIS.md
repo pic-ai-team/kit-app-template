@@ -1,105 +1,126 @@
-# Automated Planogram Analysis Architecture
+# Automated Shelf Analysis Architecture
 
-This document describes the design and implementation of the automated planogram analysis feature
+This document describes the design and implementation of the automated shelf analysis feature using the service robot.
 
-Naming convention:
-Rack: The shelving unit
-Shelf: 1 Level in a rack
+## Naming Convention
+- **Rack**: The shelving unit (e.g., "Snacks Rack 6B")
+- **Shelf**: One level/row within a rack
+
+## Architecture Overview
+
+The system uses a three-layer architecture for robot-based shelf analysis:
+
+```
+NemoClaw Agent ──► Agent Backend (FastAPI) ──► Kit API Server (aiohttp, port 8100)
+                                                     │
+                                                     ▼
+                                               Robot Controller
+                                                 ├─ Navigate to waypoint (A* nav mesh)
+                                                 ├─ Capture high-res frame (robot camera)
+                                                 └─ Return to start position
+```
 
 ### Stages
 
-#### V1: Shelf stock analysis with hidden camera (No planogram compliance)
+#### V1: Shelf stock analysis with hidden camera (Deprecated)
+Used a hidden CCTV camera teleported to waypoints. Route prefix: `planogram_analysis_`.
 
-#### Rack name logic
-Each product initially spawned in the store should belong to a specific rack. That information is encoded as an attribute of each object (rack_id). During the initial stage scan, Each item_instance gets a rack_id (If the attribute is missing, then set to "rack_1" for now). A new table called racks stores rack_id (PK), rack_name, min_x, max_x, min_y, max_y, min_z, max_z. (Leave the positions as 0 for now). The table is filled during the initial stage scan from an asset_file called `store_layout.json`.
+#### V2: Robot-based shelf analysis (Current)
+The service robot physically navigates to each waypoint, captures frames from its on-board camera, and returns to its initial position after analysis.
 
+### Route Convention
+Routes are stored in `nav_routes.json` with the prefix `robot_shelf_analysis_` (e.g., `robot_shelf_analysis_snacks`). The robot controller loads routes with the `robot_` prefix and converts camera-convention yaw (+Y forward) to robot-convention yaw (+X forward) by adding 90°.
 
-##### Camera logic
-A hidden camera is spawned the same way as the **cctv cameras** in `cctv_capture.py` file. It jumps along a defined route (can be configured in UI) using the existing route logic with a denotation `planogram_analysis_<route_name>` (similar concept to navigation points for cctv cameras e.g., `cctv_drinks_aisle`). 
+### Robot Camera
+The robot camera is mounted on the robot prim at `/World/Robots/service_robotV1/Camera`. For shelf analysis it uses a tall vertical resolution (400×1000 pixels, JPEG Q90) to capture full rack height. This is separate from the default thumbnail resolution (250×175) used for UI previews.
 
-##### Shelf stock analysis logic
-Currently there are 2 planogram analysis functions. The old one `_run_planogram_analysis` and the new one `_run_shelf_analysis`. We want to utilize the new version `_run_shelf_analysis`. We create a new function called `_run_automatic_shelf_analysis`: It should take a route instead of just the viewport. 
-At each route position, a camera is spawned at the coordinates and the camera captures a frame and sends a request to the agent backend `/api/identify-shelf-products` endpoint. 
+Key methods in `robot_camera.py`:
+- `capture_frame(width, quality)` — Standard thumbnail capture with downscaling
+- `capture_frame_full_res(width, height, quality)` — High-res capture without compression, recreates HydraTexture at requested resolution and restores default after capture
 
-`/api/identify-shelf-products` returns object:
-```python
-"asset_keys": ["pringles_bbq", "pringles_cheese", "pringles_pizza", "cheetos_double_cheese"],
-```
+### Rack Name Logic
+Each product in the store has a `rack_id` attribute. During vision identification, the backend uses majority vote across identified `asset_keys` to determine the rack. The rack name is looked up from the `racks` table (seeded from `store_layout.json`).
 
-`_run_shelf_analysis` return object:
-```python
+### Shelf Stock Analysis Pipeline
+
+For each waypoint in the route:
+1. **Navigate**: Robot navigates to waypoint via A* pathfinding on the nav mesh
+2. **Wait**: `navigate_to_and_wait()` blocks until the robot arrives (up to 120s timeout)
+3. **Capture**: High-res frame (400×1000, Q90) from robot's on-board camera
+4. **Identify**: POST frame to `/api/identify-shelf-products` → `asset_keys`, `product_info`, `rack_id`
+5. **Detect rows**: `usd_spawner.detect_rows_for_key()` per product (floor_z clustering)
+6. **Return**: Robot returns to initial position via `reset()`
+
+After all waypoints:
+- Merge results by `rack_id` (deduplicate products across waypoints)
+- Cluster rows into shelf levels by `floor_z` proximity (2× tolerance gap)
+- Compute stock ratios: `shelf_init_stock = product_init_stock / num_shelves_product_appears_on`
+
+### Response Format
+
+`_run_automatic_shelf_analysis` returns:
+```json
 {
-    "products": ["pringles_bbq", "pringles_cheese", "pringles_pizza", "cheetos_double_cheese"],
-    "shelf_levels": [
+    "success": true,
+    "route": "robot_shelf_analysis_snacks",
+    "waypoint_count": 3,
+    "results": [
         {
-            "level": 1,
-            "floor_z": 114.08,
-            "products": {
-                "pringles_cheese": {
-                    "count": 8
+            "rack_id": "rack_6B",
+            "rack_name": "Snacks Rack 6B",
+            "waypoint_count": 2,
+            "stock_level": 0.66,
+            "stock": 40,
+            "initial_stock": 60,
+            "asset_keys": ["pringles_bbq", "pringles_cheese", "cheetos_double_cheese"],
+            "shelf_levels": [
+                {
+                    "level": 1,
+                    "floor_z": 114.08,
+                    "shelf_stock_level": 0.5,
+                    "products": {
+                        "pringles_cheese": {"stock": 3, "initial_stock": 8},
+                        "pringles_bbq": {"stock": 3, "initial_stock": 8},
+                        "cheetos_double_cheese": {"stock": 5, "initial_stock": 8}
+                    }
                 },
-                "pringles_pizza": {
-                    "count": 8
-                },
-                "pringles_bbq": {
-                    "count": 8
-                },
-                "cheetos_double_cheese": {
-                    "count": 8
+                {
+                    "level": 2,
+                    "floor_z": 85.0,
+                    "shelf_stock_level": 0.8,
+                    "products": { "..." : "..." }
                 }
-            }
-        }
-    ]
-}
-```
-=> Shelf analysis should be able to provide more information
-1. Current stock vs initial stock (Like 20% left)
-2. Rack name (For each product we get a rack_id, we take a majority vote and then retrieve the rack_name using a new api endpoint GET rack/{id})
-=> `/api/identify-shelf-products` has to return richer information. It should for each asset_key return their info using `db.get_catalog_entry(asset_key)`:
-=> The Shelf analysis can calculate the stock ratio like 20% left using the count generated in `run_shelf_analysis` and the `init_stock` from `api/identify-shelf-products`
-=> We infer the shelf_level initial stock by dividing the product initial stock by the number of shelfs the product is on. e.g., pringles BBQ initial_stock is 32 and is on 4 shelf_levels, so for each shelf_level the initial_stock is 8
-`_run_automatic_shelf_analysis` should return an object of this shape:
-```python
-{
-    "products": ["pringles_bbq", "pringles_cheese", "pringles_pizza", "cheetos_double_cheese"],
-    "rack_name": "drinks rack,
-    "stock_level": 0.66,
-    "stock": 40,
-    "initial_stock": 60,
-    "shelf_levels": [
-        {
-            "level": 1,
-            "floor_z": 114.08,
-            "shelf_stock_level": 0.5
-            "products": {
-                "pringles_cheese": {
-                    "stock": 3,
-                    "initial_stock": 8
-                },
-                "pringles_pizza": {
-                    "stock": 5,
-                    "initial_stock": 8
-                },
-                "pringles_bbq": {
-                    "stock": 3,
-                    "initial_stock": 8
-                },
-                "cheetos_double_cheese": {
-                    "stock": 5,
-                    "initial_stock": 8
-                }
-            }
-        },
-        {
-            "level": 2,
-            ...
+            ]
         }
     ]
 }
 ```
 
+### Accessing Automated Shelf Analysis
 
-##### Accessing automated shelf analyzis
-- **Via the Webviewer:** The Planogram Analysis Tab should be extended at the top with a new section called: Automatic Shelf Analysis. On the left should be a dropdown where the user can select one of the available routes (filtered for all with the `planogram_analysis_` prefix). Then there is a run button that will show a loading spinner while the analysis is running. The result will be rendered as a list of navigation points. For each navigation point (frame) there is the rack name with stock_level, and for each shelf_level the shelf_stock_level, and a list of products, and their status like stocked 32/32 or medium 18/32 low 3/32. 
-- **Via the Kit API Server:**: A new api enpoint called /planogram/shelf-analysis which takes a route as a parameter and will perform the `_run_automatic_shelf_analysis` function and return the `_run_automatic_shelf_analysis` result as json
+#### Via the Agent Backend API (primary)
+Two endpoints proxy to the Kit API server:
 
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/robot/shelf-analysis/routes` | GET | List available `robot_shelf_analysis_*` routes |
+| `/api/robot/shelf-analysis?route=<name>` | GET | Run analysis on a route (long-running, up to 10 min timeout) |
+
+#### Via the Kit API Server (internal)
+The Kit `APIServer` (port 8100) exposes:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/robot/shelf-analysis/routes` | GET | List available routes |
+| `/robot/shelf-analysis?route=<name>` | GET | Run analysis (robot navigates, captures, analyzes) |
+
+#### Via the Webviewer
+The Planogram Analysis Tab includes an "Automatic Shelf Analysis" section with a dropdown for `robot_shelf_analysis_*` routes and a run button.
+
+#### Via NemoClaw
+The `perform-automatic-shelf-analysis` skill (v2.0) automates:
+1. Fetch available routes from `/api/robot/shelf-analysis/routes`
+2. Run analysis via `/api/robot/shelf-analysis?route=<name>`
+3. Format results and send to Store Manager via Telegram
+
+Policy blueprint: `omniverse-agent-backend-robot-shelf-analysis.yaml`

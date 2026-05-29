@@ -20,6 +20,7 @@ the yaw (rotation around Z in the Z-up store).
 
 from typing import Any, Callable, Dict, List, Optional
 
+import asyncio
 import carb
 
 from .robot_nav_mesh import RobotNavMesh, get_robot_nav_mesh
@@ -30,8 +31,10 @@ from .robot_drive_controller import (
 from .robot_camera import RobotCamera, get_robot_camera
 
 # Prefix used to identify robot nav presets / routes
-
 ROBOT_PREFIX = "robot_"
+
+# Prefix for robot shelf analysis routes
+ROBOT_SHELF_ANALYSIS_PREFIX = "robot_shelf_analysis_"
 
 class RobotController:
     """
@@ -259,6 +262,57 @@ class RobotController:
         self._drive.navigate_to(loc[0], loc[1], target_yaw=yaw)
 
     # ------------------------------------------------------------------
+    # Await-able navigation (for automated workflows)
+    # ------------------------------------------------------------------
+
+    async def navigate_to_and_wait(
+        self, x: float, y: float, target_yaw: Optional[float] = None, timeout: float = 120.0
+    ) -> bool:
+        """
+        Navigate to (x, y) and block until the robot arrives or times out.
+
+        Returns True if the robot arrived, False on timeout.
+        """
+        self._ensure_initialized()
+        self._route_queue = []
+        self._navigating_route = False
+
+        arrived_event = asyncio.Event()
+        original_on_arrive = self._drive._on_arrive
+
+        def _on_arrive_signal():
+            arrived_event.set()
+            if original_on_arrive:
+                original_on_arrive()
+
+        self._drive.set_on_arrive(_on_arrive_signal)
+
+        ok = self._drive.navigate_to(x, y, target_yaw=target_yaw)
+        if not ok:
+            self._drive.set_on_arrive(self._on_robot_arrived)
+            return False
+
+        try:
+            await asyncio.wait_for(arrived_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            carb.log_warn(f"[RobotController] navigate_to_and_wait timed out ({timeout}s)")
+            return False
+        finally:
+            self._drive.set_on_arrive(self._on_robot_arrived)
+
+    # ------------------------------------------------------------------
+    # Shelf analysis routes
+    # ------------------------------------------------------------------
+
+    def get_shelf_analysis_routes(self) -> Dict[str, Dict[str, Any]]:
+        """Return only routes with the robot_shelf_analysis_ prefix."""
+        return {
+            k: v for k, v in self._routes.items()
+            if k.startswith(ROBOT_SHELF_ANALYSIS_PREFIX)
+        }
+
+    # ------------------------------------------------------------------
     # Camera
     # ------------------------------------------------------------------
 
@@ -269,6 +323,18 @@ class RobotController:
         if frame:
             return {"ok": True, "frame": frame}
         return {"ok": False, "error": "Capture failed"}
+
+    async def capture_frame_full_res(
+        self, width: int = 400, height: int = 1000, quality: int = 90
+    ) -> Dict[str, Any]:
+        """Take a high-resolution snapshot (no thumbnail compression)."""
+        self._ensure_initialized()
+        frame = await self._camera.capture_frame_full_res(
+            width=width, height=height, quality=quality
+        )
+        if frame:
+            return {"ok": True, "frame": frame}
+        return {"ok": False, "error": "Full-res capture failed"}
 
     # ------------------------------------------------------------------
     # Robot status

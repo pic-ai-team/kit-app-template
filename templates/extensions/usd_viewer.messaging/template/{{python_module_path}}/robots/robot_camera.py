@@ -22,7 +22,7 @@ from .robot_drive_controller import (
 
 # Resolution for robot camera captures
 ROBOT_CAM_WIDTH = 250
-ROBOT_CAM_HEIGHT = 1000
+ROBOT_CAM_HEIGHT = 175
 
 
 class RobotCamera:
@@ -195,6 +195,18 @@ class RobotCamera:
                 future.set_result(None)
 
     # ------------------------------------------------------------------
+    # HydraTexture resolution management
+    # ------------------------------------------------------------------
+
+    def _recreate_hydra_texture(self, width: int, height: int) -> bool:
+        """Tear down and recreate the HydraTexture at a new resolution."""
+        if self._hydra_texture is not None:
+            self._drawable_sub = None
+            self._hydra_texture = None
+        self._hydra_size = (width, height)
+        return self._ensure_hydra_texture()
+
+    # ------------------------------------------------------------------
     # Public capture API
     # ------------------------------------------------------------------
 
@@ -218,6 +230,78 @@ class RobotCamera:
             return await self._do_capture(width, quality)
         finally:
             self._capturing = False
+
+    async def capture_frame_full_res(
+        self,
+        width: int = 2000,
+        height: int = 2000,
+        quality: int = 90,
+    ) -> Optional[str]:
+        """
+        Capture a high-resolution frame without thumbnail downscaling.
+
+        Recreates the HydraTexture at the requested resolution if needed,
+        captures the raw frame, and returns a base64 JPEG at full size.
+        After capture, restores the default thumbnail resolution.
+
+        Args:
+            width:   Render width in pixels.
+            height:  Render height in pixels.
+            quality: JPEG quality (1-100).
+
+        Returns:
+            Base64-encoded JPEG at the requested resolution, or None.
+        """
+        if self._capturing:
+            carb.log_warn("[RobotCamera] Capture already in progress")
+            return None
+
+        self._capturing = True
+        try:
+            return await self._do_capture_full_res(width, height, quality)
+        finally:
+            self._capturing = False
+
+    async def _do_capture_full_res(
+        self, width: int, height: int, quality: int
+    ) -> Optional[str]:
+        if not self._is_robot_camera():
+            return None
+
+        # Switch to the requested resolution
+        if self._hydra_size != (width, height):
+            if not self._recreate_hydra_texture(width, height):
+                carb.log_warn("[RobotCamera] HydraTexture unavailable at requested resolution")
+                return None
+        else:
+            if not self._ensure_hydra_texture():
+                carb.log_warn("[RobotCamera] HydraTexture unavailable")
+                return None
+
+        # Wait for USD pose propagation
+        await asyncio.sleep(0.15)
+
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        self._capture_state = {"future": future, "skip": 3}
+
+        try:
+            frame_b64 = await asyncio.wait_for(future, timeout=15.0)
+        except asyncio.TimeoutError:
+            carb.log_warn("[RobotCamera] Full-res capture timed out (15s)")
+            frame_b64 = None
+        finally:
+            self._capture_state = None
+
+        # Restore default thumbnail resolution for normal captures
+        if self._hydra_size != (ROBOT_CAM_WIDTH, ROBOT_CAM_HEIGHT):
+            self._recreate_hydra_texture(ROBOT_CAM_WIDTH, ROBOT_CAM_HEIGHT)
+
+        if not frame_b64:
+            return None
+
+        # Re-encode at requested quality without downscaling
+        return _reencode_jpeg(frame_b64, quality)
 
     async def _do_capture(self, width: int, quality: int) -> Optional[str]:
         if not self._is_robot_camera():
@@ -326,6 +410,26 @@ def _make_thumbnail(b64_jpeg: str, max_width: int, quality: int) -> Optional[str
             ratio = max_width / w
             new_h = int(h * ratio)
             img = img.resize((max_width, new_h), Image.LANCZOS)
+
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except ImportError:
+        return b64_jpeg
+    except Exception:
+        return b64_jpeg
+
+
+def _reencode_jpeg(b64_jpeg: str, quality: int) -> Optional[str]:
+    """Re-encode a base64 JPEG at the given quality without resizing."""
+    try:
+        from PIL import Image
+
+        raw = base64.b64decode(b64_jpeg)
+        img = Image.open(io.BytesIO(raw))
 
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
