@@ -2195,6 +2195,9 @@ class UsdSpawner:
     def on_shutdown(self) -> None:
         self._update_sub = None  # release deferred scan subscription
         for sub in self._subscriptions:
-            sub.unsubscribe()
+            # ObserverGuard (carb.eventdispatcher) cleans up on deletion,
+            # older IEventStream subscriptions use .unsubscribe().
+            if hasattr(sub, 'unsubscribe'):
+                sub.unsubscribe()
         self._subscriptions.clear()
         carb.log_info("[UsdSpawner] Shutdown")

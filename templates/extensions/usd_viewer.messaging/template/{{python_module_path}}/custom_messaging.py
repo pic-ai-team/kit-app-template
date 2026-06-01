@@ -12,6 +12,7 @@ import carb.events
 from carb.eventdispatcher import get_eventdispatcher
 import omni.kit.app
 import omni.kit.livestream.messaging as messaging
+import omni.usd
 from omni.timeline import get_timeline_interface
 
 from .viewport_capture import ViewportCapture
@@ -90,6 +91,8 @@ class CustomMessageManager:
             "shortcutsResponse",         # Full shortcut list (after any CRUD operation)
             "shortcutThumbnail",          # Per-shortcut thumbnail (key + base64 JPEG)
             "shortcutClickResponse",      # Reply after clicking / navigating to a shortcut
+            "reloadStageResponse",        # Reply after reloading the USD stage
+            "restartKitResponse",         # Reply before Kit process restarts
         ]
 
         for message_type in outgoing_messages:
@@ -153,6 +156,9 @@ class CustomMessageManager:
             'setCameraSpeed':           self._on_set_camera_speed,
             'joystickMove':             self._on_joystick_move,
             'joystickLook':             self._on_joystick_look,
+            # Stage reload / Kit restart
+            'reloadStageRequest':       self._on_reload_stage_request,
+            'restartKitRequest':        self._on_restart_kit_request,
         }
 
         ed = get_eventdispatcher()
@@ -2307,6 +2313,140 @@ class CustomMessageManager:
             carb.log_warn(f"[CustomMessageManager] joystickLook error: {exc}")
 
     # ===== END JOYSTICK CAMERA CONTROL =====
+
+    # =========================================================================
+    # STAGE RELOAD / KIT RESTART
+    # =========================================================================
+
+    def _on_reload_stage_request(self, event: carb.events.IEvent) -> None:
+        """
+        Handle reloadStageRequest message from the web client.
+        Resets all subsystems (fire, spawner, robot, nav, etc.) and
+        force-reloads the current USD stage from disk.
+        """
+        carb.log_info("[CustomMessageManager] reloadStageRequest received — resetting subsystems & reloading stage")
+        asyncio.ensure_future(self._do_reload_stage())
+
+    async def _do_reload_stage(self) -> None:
+        """Reset all subsystems and force-reload the current USD stage."""
+        try:
+            # 1. Extinguish all fire incidents
+            if self._fire_manager:
+                self._fire_manager.extinguish_all()
+                carb.log_info("[ReloadStage] Extinguished all fire incidents")
+
+            # 2. Cancel pending chat requests
+            for request_id in list(self._pending_requests.keys()):
+                self._pending_requests[request_id]['cancelled'] = True
+            self._pending_requests.clear()
+
+            # 3. Clear camera tracking
+            self._last_camera_positions.clear()
+
+            # 4. Reset robot controller
+            if self._robot_controller:
+                try:
+                    self._robot_controller.shutdown()
+                    self._robot_controller = get_robot_controller()
+                    self._robot_controller.initialize()
+                    carb.log_info("[ReloadStage] Robot controller reset")
+                except Exception as e:
+                    carb.log_warn(f"[ReloadStage] Robot reset error: {e}")
+
+            # 5. Force-reload the current USD stage
+            usd_context = omni.usd.get_context()
+            stage = usd_context.get_stage()
+            if stage:
+                stage_url = stage.GetRootLayer().identifier
+                if stage_url:
+                    carb.log_info(f"[ReloadStage] Closing and reopening: {stage_url}")
+                    # Close current stage first
+                    await usd_context.close_stage_async()
+                    # Small delay for clean teardown
+                    for _ in range(3):
+                        await omni.kit.app.get_app().next_update_async()
+                    # Reopen the same stage
+                    result, error = await usd_context.open_stage_async(
+                        stage_url, omni.usd.UsdContextInitialLoadSet.LOAD_ALL
+                    )
+                    if result:
+                        carb.log_info("[ReloadStage] Stage reloaded successfully")
+                    else:
+                        carb.log_error(f"[ReloadStage] Failed to reload stage: {error}")
+                        get_eventdispatcher().dispatch_event(
+                            "reloadStageResponse",
+                            payload={"result": "error", "error": str(error)},
+                        )
+                        return
+                else:
+                    carb.log_warn("[ReloadStage] No stage URL — nothing to reload")
+            else:
+                carb.log_warn("[ReloadStage] No active stage — nothing to reload")
+
+            # 6. Reinitialise USD spawner (clears in-memory tracking)
+            if self._usd_spawner:
+                self._usd_spawner.on_shutdown()
+            self._usd_spawner = UsdSpawner()
+
+            # Keep UsdSpawner's deferred scan enabled and also attempt a
+            # best-effort immediate scan once /World has children.
+            # Duplicate PUTs are safe because backend PUT fully replaces state.
+            carb.log_info('[ReloadStage] Waiting for stage content before inventory scan...')
+            scanned = False
+            for attempt in range(300):
+                await omni.kit.app.get_app().next_update_async()
+                s = omni.usd.get_context().get_stage()
+                if s:
+                    world = s.GetPrimAtPath("/World")
+                    if world and list(world.GetChildren()):
+                        carb.log_info(
+                            f'[ReloadStage] /World children detected on frame {attempt} — running inventory scan'
+                        )
+                        try:
+                            self._usd_spawner._scan_stage_to_inventory()
+                            scanned = True
+                        except Exception as e:
+                            carb.log_warn(f'[ReloadStage] Inventory scan failed: {e}')
+                        break
+            if not scanned:
+                carb.log_warn('[ReloadStage] Stage content not ready in 300 frames; deferred scan remains active')
+
+            # 7. Send success response (stage OPENED event will trigger the
+            #    normal loadingState/openedStageResult flow for the frontend)
+            get_eventdispatcher().dispatch_event(
+                "reloadStageResponse",
+                payload={"result": "success", "error": ""},
+            )
+            carb.log_info("[ReloadStage] Reload complete")
+        except Exception as exc:
+            carb.log_error(f"[ReloadStage] Error: {exc}")
+            get_eventdispatcher().dispatch_event(
+                "reloadStageResponse",
+                payload={"result": "error", "error": str(exc)},
+            )
+
+    def _on_restart_kit_request(self, event: carb.events.IEvent) -> None:
+        """
+        Handle restartKitRequest message from the web client.
+        Sends a confirmation response then gracefully shuts down the Kit
+        process.  A process manager (systemd / wrapper script) should
+        restart Kit automatically.
+        """
+        carb.log_warn("[CustomMessageManager] restartKitRequest received — shutting down Kit process")
+        # Notify frontend that Kit is going down
+        get_eventdispatcher().dispatch_event(
+            "restartKitResponse",
+            payload={"result": "restarting"},
+        )
+        # Schedule the quit after a small delay so the response can be sent
+        async def _quit():
+            for _ in range(5):
+                await omni.kit.app.get_app().next_update_async()
+            carb.log_warn("[CustomMessageManager] Posting quit…")
+            omni.kit.app.get_app().post_quit()
+        asyncio.ensure_future(_quit())
+
+    # ===== END STAGE RELOAD / KIT RESTART =====
 
     def on_shutdown(self):
         """Clean up when the manager is shut down"""

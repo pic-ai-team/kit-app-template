@@ -21,9 +21,9 @@
     "scale_z": 0.15
   },
   "lipton_milktea": {
-    "scale_x": 50.1,
-    "scale_y": 50.1,
-    "scale_z": 50.1
+    "scale_x": 0.5,
+    "scale_y": 0.5,
+    "scale_z": 0.5
   },
   "cheetos_cheddar_jalapeno": {
     "scale_x": 0.9,
@@ -46,9 +46,9 @@
     "scale_z": 0.75
   },
   "lipton_iced_tea": {
-    "scale_x": 50.1,
-    "scale_y": 50.1,
-    "scale_z": 50.1
+    "scale_x": 0.6,
+    "scale_y": 0.6,
+    "scale_z": 0.6
   },
   "nittotea_milktea": {
     "scale_x": 50.1,
@@ -111,14 +111,14 @@
     "scale_z": 19.7
   },
   "pringles_cheese": {
-    "scale_x": 46.0,
-    "scale_y": 46.0,
-    "scale_z": 46.0
+    "scale_x": 0.2,
+    "scale_y": 0.2,
+    "scale_z": 0.2
   },
   "pringles_bbq": {
-    "scale_x": 24.75,
-    "scale_y": 24.75,
-    "scale_z": 24.75
+    "scale_x": 0.25,
+    "scale_y": 0.25,
+    "scale_z": 0.25
   },
   "pringles_pizza": {
     "scale_x": 23.8,

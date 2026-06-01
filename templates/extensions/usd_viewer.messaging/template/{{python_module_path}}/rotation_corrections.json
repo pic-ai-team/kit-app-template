@@ -16,12 +16,12 @@
     "offset_z": 14.0
   },
   "lipton_milktea": {
-    "euler_x": 21.0,
-    "euler_y": 76.0,
-    "euler_z": 72.0,
+    "euler_x": 0.0,
+    "euler_y": 0.0,
+    "euler_z": 90.0,
     "offset_x": 0.0,
     "offset_y": 0.0,
-    "offset_z": 6.0
+    "offset_z": -6.0
   },
   "cheetos_flaming_hot": {
     "euler_x": 90.0,
@@ -32,15 +32,15 @@
     "offset_z": 16.0
   },
   "spilled_coffee": {
-    "euler_x": 89.0,
+    "euler_x": 0.0,
     "euler_y": 0.0,
     "euler_z": 0.0,
     "offset_x": 0.0,
     "offset_y": 0.0,
-    "offset_z": 6.0
+    "offset_z": 0.0
   },
   "trash": {
-    "euler_x": -90.0,
+    "euler_x": 0.0,
     "euler_y": 0.0,
     "euler_z": 0.0,
     "offset_x": 0.0,
@@ -48,12 +48,12 @@
     "offset_z": 0.0
   },
   "lipton_iced_tea": {
-    "euler_x": 90.0,
+    "euler_x": 0.0,
     "euler_y": 0.0,
-    "euler_z": 0.0,
+    "euler_z": 90.0,
     "offset_x": 0.0,
     "offset_y": 0.0,
-    "offset_z": 9.0
+    "offset_z": -2.0
   },
   "freshdel_coco_tea": {
     "euler_x": 90.0,
@@ -144,20 +144,20 @@
     "offset_z": 9.0
   },
   "pringles_cheese": {
-    "euler_x": 90.0,
+    "euler_x": 0.0,
     "euler_y": 0.0,
-    "euler_z": -12.0,
+    "euler_z": 0.0,
     "offset_x": 0.0,
     "offset_y": 0.0,
-    "offset_z": 11.0
+    "offset_z": -2.0
   },
   "pringles_bbq": {
-    "euler_x": 90.0,
+    "euler_x": 0.0,
     "euler_y": 0.0,
-    "euler_z": -12.0,
+    "euler_z": 0.0,
     "offset_x": 0.0,
     "offset_y": 0.0,
-    "offset_z": 11.0
+    "offset_z": 0.0
   },
   "pringles_pizza": {
     "euler_x": 84.0,
@@ -318,5 +318,53 @@
     "offset_x": 0.0,
     "offset_y": 0.0,
     "offset_z": 50.0
+  },
+  "lays_classic": {
+    "euler_x": 0.0,
+    "euler_y": 0.0,
+    "euler_z": -90.0,
+    "offset_x": 0.0,
+    "offset_y": 0.0,
+    "offset_z": 0.0
+  },
+  "lays_chile_limon": {
+    "euler_x": 0.0,
+    "euler_y": 0.0,
+    "euler_z": -90.0,
+    "offset_x": 0.0,
+    "offset_y": 0.0,
+    "offset_z": 0.0
+  },
+  "lays_cheddar": {
+    "euler_x": 0.0,
+    "euler_y": 0.0,
+    "euler_z": -90.0,
+    "offset_x": 0.0,
+    "offset_y": 0.0,
+    "offset_z": 0.0
+  },
+  "lays_dill_pickle": {
+    "euler_x": 0.0,
+    "euler_y": 0.0,
+    "euler_z": -90.0,
+    "offset_x": 0.0,
+    "offset_y": 0.0,
+    "offset_z": 0.0
+  },
+  "lays_sweet_bbq": {
+    "euler_x": 0.0,
+    "euler_y": 0.0,
+    "euler_z": -90.0,
+    "offset_x": 0.0,
+    "offset_y": 0.0,
+    "offset_z": 0.0
+  },
+  "lays_flaming_hot": {
+    "euler_x": 0.0,
+    "euler_y": 0.0,
+    "euler_z": -90.0,
+    "offset_x": 0.0,
+    "offset_y": 0.0,
+    "offset_z": 0.0
   }
 }
