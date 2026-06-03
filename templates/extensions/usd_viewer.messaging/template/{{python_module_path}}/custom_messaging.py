@@ -1839,12 +1839,6 @@ class CustomMessageManager:
             if not paths:
                 return
 
-            # Optional: block all non-marker selections
-            if self._markers_only_selection:
-                if not any(p.startswith(self.WAYPOINTS_ROOT + "/") for p in paths):
-                    selection.clear_selected_prim_paths()
-                    return
-
             # ── Placement mode: use the clicked prim's world position ──────
             if self._pending_marker is not None:
                 # Find any valid prim that was clicked (skip waypoint prims themselves)
@@ -1875,6 +1869,13 @@ class CustomMessageManager:
                     self._save_markers()
                     self._create_marker_prim(key, pending["name"], list(position), pending["type"])
                     selection.clear_selected_prim_paths()
+                    # Re-lock pickability if markers-only is active
+                    if self._markers_only_selection:
+                        try:
+                            usd_context.set_pickable("/", False)
+                            usd_context.set_pickable(self.WAYPOINTS_ROOT, True)
+                        except Exception:
+                            pass
                     carb.log_info(f"[CustomMessageManager] Placed marker '{key}' at {list(position)} via prim click")
                     self._dispatch_markers()
                     get_eventdispatcher().dispatch_event(
@@ -1906,11 +1907,26 @@ class CustomMessageManager:
             carb.log_warn(f"[CustomMessageManager] Selection handler error: {e}")
 
     def _on_set_markers_only_selection(self, event: carb.events.IEvent) -> None:
-        self._markers_only_selection = bool(event.payload.get("enabled", False))
-        carb.log_info(f"[CustomMessageManager] markers-only selection: {self._markers_only_selection}")
+        """Toggle waypoint-only selection mode via set_pickable()."""
+        enabled = bool(event.payload.get("enabled", False))
+        self._markers_only_selection = enabled
+        try:
+            import omni.usd
+            ctx = omni.usd.get_context()
+            if enabled:
+                # Block all viewport clicks at the engine level
+                ctx.set_pickable("/", False)
+                # Re-allow waypoint prims so 3D marker clicks still fire
+                ctx.set_pickable(self.WAYPOINTS_ROOT, True)
+            else:
+                # Restore full pickability (mirrors _on_make_pickable reset)
+                ctx.set_pickable("/", True)
+        except Exception as e:
+            carb.log_warn(f"[CustomMessageManager] set_pickable failed: {e}")
+        carb.log_info(f"[CustomMessageManager] markers-only selection: {enabled}")
 
     def _on_start_marker_placement(self, event: carb.events.IEvent) -> None:
-        """Browser has entered click-to-place mode. Store the pending marker metadata."""
+        """Store pending marker and temporarily unlock pickability if markers-only is active."""
         payload = event.payload or {}
         self._pending_marker = {
             "name":        payload.get("name", "").strip(),
@@ -1918,11 +1934,29 @@ class CustomMessageManager:
             "type":        payload.get("type", "navigation"),
             "image_url":   payload.get("image_url", ""),
         }
+        # Temporarily unlock so the placement click can reach the engine
+        if self._markers_only_selection:
+            try:
+                import omni.usd
+                ctx = omni.usd.get_context()
+                ctx.set_pickable("/", True)
+                carb.log_info("[CustomMessageManager] Placement mode: pickability unlocked temporarily")
+            except Exception as e:
+                carb.log_warn(f"[CustomMessageManager] set_pickable unlock failed: {e}")
         carb.log_info(f"[CustomMessageManager] Marker placement started: {self._pending_marker['name']} ({self._pending_marker['type']})")
 
     def _on_cancel_marker_placement(self, event: carb.events.IEvent) -> None:
-        """Browser cancelled the click-to-place flow."""
+        """Cancel placement and re-lock pickability if markers-only is active."""
         self._pending_marker = None
+        if self._markers_only_selection:
+            try:
+                import omni.usd
+                ctx = omni.usd.get_context()
+                ctx.set_pickable("/", False)
+                ctx.set_pickable(self.WAYPOINTS_ROOT, True)
+                carb.log_info("[CustomMessageManager] Placement cancelled: pickability re-locked")
+            except Exception as e:
+                carb.log_warn(f"[CustomMessageManager] set_pickable re-lock failed: {e}")
         carb.log_info("[CustomMessageManager] Marker placement cancelled")
 
     def _on_save_nav_marker_here(self, event: carb.events.IEvent) -> None:
