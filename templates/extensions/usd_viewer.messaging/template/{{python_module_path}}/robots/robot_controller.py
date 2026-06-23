@@ -18,16 +18,22 @@ The ``rotation`` field ``[rx, ry, rz]`` stores Euler XYZ; ``rz`` is
 the yaw (rotation around Z in the Z-up store).
 """
 
+import json
 from typing import Any, Callable, Dict, List, Optional
 
 import asyncio
+
+from anyio import Path
 import carb
 
 from .robot_nav_mesh import RobotNavMesh, get_robot_nav_mesh
 from .robot_drive_controller import (
+    ROBOT_MOVE_SPEED,
+    ROBOT_PRIM_PATH,
+    ROBOT_TURN_SPEED,
     RobotDriveController,
     get_robot_drive_controller,
-)
+) 
 from .robot_camera import RobotCamera, get_robot_camera
 
 # Prefix used to identify robot nav presets / routes
@@ -35,6 +41,23 @@ ROBOT_PREFIX = "robot_"
 
 # Prefix for robot shelf analysis routes
 ROBOT_SHELF_ANALYSIS_PREFIX = "robot_shelf_analysis_"
+
+# Import robot from robot config
+ROBOT_CONFIG_DATA = {}
+current_dir = Path(__file__).parent
+config_path = current_dir / 'robot_config.json'
+try:
+    with open(config_path, 'r') as file:
+        ROBOT_CONFIG_DATA = json.load(file)
+except Exception as e:
+    carb.log_error(f"Failed to load robot_config.json: {e}")
+
+### CURRENT ROBOT:
+ACTIVE_ROBOT = "service_robotV1"
+if ACTIVE_ROBOT in ROBOT_CONFIG_DATA:
+    ACTIVE_ROBOT_CONFIG = ROBOT_CONFIG_DATA[ACTIVE_ROBOT]
+    carb.log_info(f"Loaded robot config for '{ACTIVE_ROBOT}': {ACTIVE_ROBOT_CONFIG}")
+
 
 class RobotController:
     """
@@ -47,14 +70,28 @@ class RobotController:
         controller.shutdown()
     """
 
-    def __init__(self):
+    def __init__(self, robot_id: str = ACTIVE_ROBOT) -> None:
+        # Read robot config from JSON file
+        if robot_id not in ROBOT_CONFIG_DATA:
+            fallback = list(ROBOT_CONFIG_DATA.keys())[0]
+            carb.log_warn(f"[RobotController] '{robot_id}' not found. Falling back to '{fallback}'.")
+            robot_id = fallback
+
+        self.robot_id = robot_id
+        self.config = ROBOT_CONFIG_DATA[robot_id]
+        
+        carb.log_info(f"[RobotController] Initialized with robot_id='{self.robot_id}' and config: {self.config}")
+    
+        # Navigation Mesh that represents the walkable area and obstacles for pathfinding
         self._nav_mesh: Optional[RobotNavMesh] = None
+        # Drive controller that manages robot movement commands and state
         self._drive: Optional[RobotDriveController] = None
+        # Robot camera for capturing frames and streaming
         self._camera: Optional[RobotCamera] = None
 
         # Robot navigation presets (robot_xxx)
         self._nav_positions: Dict[str, Dict[str, Any]] = {}
-        # Robot routes
+        # Robot routes (robot_xxx)
         self._routes: Dict[str, Dict[str, Any]] = {}
 
         # Status callback (pushed to frontend via messaging)
@@ -77,18 +114,29 @@ class RobotController:
 
         carb.log_info("[RobotController] Initializing...")
 
-        # Nav mesh
+
+        # Nav mesh (not yet initialized, since requires stage geometry to build.)
         self._nav_mesh = get_robot_nav_mesh(cell_size=10.0, robot_radius=50.0)
-        # Build is deferred until the stage is loaded — see build_nav_mesh()
 
         # Drive controller
-        self._drive = get_robot_drive_controller()
+        self._drive = get_robot_drive_controller(robot_prim_path=self.config.get("robot_prim_path", ROBOT_PRIM_PATH),
+                                                 robot_move_speed=self.config.get("robot_move_speed", ROBOT_MOVE_SPEED),
+                                                 robot_turn_speed=self.config.get("robot_turn_speed", ROBOT_TURN_SPEED))
         self._drive.start()
         self._drive.set_on_arrive(self._on_robot_arrived)
         self._drive.set_on_status(self._on_drive_status)
 
         # Camera
-        self._camera = get_robot_camera()
+        self._camera = get_robot_camera(robot_prim_path=self.config.get("robot_prim_path", ROBOT_PRIM_PATH))
+        self._camera.configure_backend_stream(
+            backend_url="http://localhost:8000",
+            fps=self.config.get("robot_stream_fps", 0.5),
+            width=self.config.get("robot_stream_width", 300),
+            height=self.config.get("robot_stream_height", 300),
+            quality=self.config.get("robot_stream_quality", 60),
+            camera_id=f"{self.robot_id}",
+        )
+        self._camera.start_backend_stream()
 
         # Load saved presets
         self._load_nav_positions()
@@ -117,10 +165,43 @@ class RobotController:
 
     def shutdown(self) -> None:
         """Stop the drive controller and clean up."""
+        if self._camera:
+            self._camera.stop_backend_stream()
         if self._drive:
             self._drive.shutdown()
         self._initialized = False
         carb.log_info("[RobotController] Shut down")
+
+    def get_camera_stream_status(self) -> Dict[str, Any]:
+        """Return camera stream status."""
+        self._ensure_initialized()
+        return self._camera.get_stream_status()
+    
+    def start_camera_stream(self, backend_url: str = None) -> Dict[str, Any]:
+        """Start continuous robot camera streaming."""
+        self._ensure_initialized()
+        self._camera.configure_backend_stream(
+            backend_url=backend_url or "http://localhost:8000",
+            fps=self.config.get("robot_stream_fps", 0.5),
+            width=self.config.get("robot_stream_width", 300),
+            height=self.config.get("robot_stream_height", 300),
+            quality=self.config.get("robot_stream_quality", 60),
+            camera_id=f"{self.robot_id}",
+        )
+        self._camera.start_backend_stream()
+        return {
+            "ok": True,
+            "stream": self._camera.get_stream_status(),
+        }
+
+    def stop_camera_stream(self) -> Dict[str, Any]:
+        """Stop continuous robot camera streaming."""
+        self._ensure_initialized()
+        self._camera.stop_backend_stream()
+        return {
+            "ok": True,
+            "stream": self._camera.get_stream_status(),
+        }
 
     # ------------------------------------------------------------------
     # Status callbacks
@@ -316,10 +397,10 @@ class RobotController:
     # Camera
     # ------------------------------------------------------------------
 
-    async def capture_frame(self, width: int = 250, quality: int = 50) -> Dict[str, Any]:
+    async def capture_frame_low_res(self, width: int = 250, quality: int = 50) -> Dict[str, Any]:
         """Take a snapshot from the robot's virtual camera."""
         self._ensure_initialized()
-        frame = await self._camera.capture_frame(width=width, quality=quality)
+        frame = await self._camera.capture_frame_low_res(width=width, quality=quality)
         if frame:
             return {"ok": True, "frame": frame}
         return {"ok": False, "error": "Capture failed"}
@@ -458,9 +539,9 @@ class RobotController:
 _robot_controller: Optional[RobotController] = None
 
 
-def get_robot_controller() -> RobotController:
+def get_robot_controller(robot_id: str = ACTIVE_ROBOT) -> RobotController:
     global _robot_controller
     if _robot_controller is None:
-        _robot_controller = RobotController()
+        _robot_controller = RobotController(robot_id=robot_id)
     return _robot_controller
 

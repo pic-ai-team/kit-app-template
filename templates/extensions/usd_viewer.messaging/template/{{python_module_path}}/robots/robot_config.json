@@ -1,7 +1,24 @@
 {
+    "service_robotV1": {
+        "robot_name": "Service Robot",
+        "robot_prim_name": "service_robotV1",
+        "robot_prim_path": "/World/Robots/service_robotV1",
+        "robot_stream_width": 300,
+        "robot_stream_height": 300,
+        "robot_stream_fps": 0.5,
+        "robot_stream_quality":60,
+        "robot_move_speed": 150.0,
+        "robot_turn_speed": 90.0
+    },
     "create_3": {
         "robot_name": "Cleaning Robot",
-        "prim_name": "create_3",
-        "prim_path": "/World/Robots/create_3"
+        "robot_prim_name": "create_3",
+        "robot_prim_path": "/World/Robots/create_3",
+        "robot_stream_width": 300,
+        "robot_stream_height": 300,
+        "robot_stream_fps": 0.5,
+        "robot_stream_quality":60,
+        "robot_move_speed": 150.0,
+        "robot_turn_speed": 90.0
     }
 }

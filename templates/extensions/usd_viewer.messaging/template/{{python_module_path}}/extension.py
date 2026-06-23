@@ -46,6 +46,7 @@ class Extension(omni.ext.IExt):
         # Initialize robot controller (starts update loop)
         self._robot_controller = get_robot_controller()
         self._robot_controller.initialize()
+        self._robot_controller.start_camera_stream(backend_url=_usd_cfg.get("backend_url", "http://localhost:8000"))
 
     def on_shutdown(self):
         """This is called every time the extension is deactivated. It is used to

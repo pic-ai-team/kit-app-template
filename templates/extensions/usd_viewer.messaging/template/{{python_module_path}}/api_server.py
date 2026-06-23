@@ -32,6 +32,9 @@ class APIServer:
                                            (returns per-rack stock data)
         GET  /robot/shelf-analysis/routes — list available robot shelf analysis routes
         GET  /health                     — simple health check
+
+        GET  /robot/camera/status        — get robot camera stream status
+        GET  /robot/camera/latest        — get latest robot camera frame
     """
 
     def __init__(self, port: int = DEFAULT_PORT):
@@ -60,6 +63,8 @@ class APIServer:
         app.router.add_get("/cctv/positions", self._handle_positions)
         app.router.add_get("/robot/shelf-analysis", self._handle_shelf_analysis)
         app.router.add_get("/robot/shelf-analysis/routes", self._handle_shelf_analysis_routes)
+        app.router.add_get("/robot/camera/status", self._handle_robot_camera_status)
+        app.router.add_get("/robot/camera/latest", self._handle_robot_camera_latest)
         app.router.add_get("/health", self._handle_health)
 
         self._runner = web.AppRunner(app)
@@ -276,6 +281,56 @@ class APIServer:
                 {"error": str(e), "routes": {}, "count": 0},
                 status=500,
             )
+
+    async def _handle_robot_camera_status(self, request):
+        """Return Kit-side robot camera stream state."""
+        from aiohttp import web
+
+        try:
+            from .robots.robot_controller import get_robot_controller
+
+            rc = get_robot_controller()
+            rc.initialize()
+            status = rc.get_camera_stream_status()
+            return web.json_response({"stream": status})
+        except Exception as e:
+            carb.log_error(f"[APIServer] Robot camera status error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_robot_camera_latest(self, request):
+        """Return latest Kit-side robot frame (base64 JPEG + metadata)."""
+        from aiohttp import web
+
+        try:
+            from .robots.robot_camera import get_robot_camera
+
+            camera = get_robot_camera()
+            frame = camera.get_latest_stream_frame()
+            status = camera.get_stream_status()
+            if not frame:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": "No frame available yet",
+                        "stream": status,
+                    },
+                    status=404,
+                )
+
+            return web.json_response(
+                {
+                    "ok": True,
+                    "camera_id": status.get("camera_id"),
+                    "timestamp": status.get("last_frame_ts"),
+                    "width": status.get("width"),
+                    "height": status.get("height"),
+                    "frame_data": frame,
+                    "stream": status,
+                }
+            )
+        except Exception as e:
+            carb.log_error(f"[APIServer] Robot camera latest frame error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
 
 
 # Module-level singleton
