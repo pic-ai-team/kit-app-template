@@ -26,12 +26,12 @@ from .robot_nav_mesh import RobotNavMesh, get_robot_nav_mesh
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Defaults: Overridden by robot config if available
 # ---------------------------------------------------------------------------
 
 # Movement speeds (scene units per second / degrees per second)
-DEFAULT_MOVE_SPEED = 150.0   # cm/s
-DEFAULT_TURN_SPEED = 90.0    # deg/s
+ROBOT_MOVE_SPEED = 150.0   # cm/s
+ROBOT_TURN_SPEED = 90.0    # deg/s
 
 # Per-tick step sizes at 60 FPS (used as fallback when dt is unavailable)
 _FALLBACK_DT = 1.0 / 60.0
@@ -48,15 +48,15 @@ class DriveState(Enum):
 
 class RobotDriveController:
     """
-    Event-stream-driven state machine that moves the Dingo robot prim
+    Event-stream-driven state machine that moves the robot prim
     on the stage along straight-line segments with standing turns.
     """
 
     def __init__(
         self,
         robot_prim_path: str = ROBOT_PRIM_PATH,
-        move_speed: float = DEFAULT_MOVE_SPEED,
-        turn_speed: float = DEFAULT_TURN_SPEED,
+        move_speed: float = ROBOT_MOVE_SPEED,
+        turn_speed: float = ROBOT_TURN_SPEED,
     ):
         self._robot_path = robot_prim_path
         self._move_speed = move_speed
@@ -541,8 +541,8 @@ class RobotDriveController:
 _drive_controller: Optional[RobotDriveController] = None
 
 
-def get_robot_drive_controller() -> RobotDriveController:
+def get_robot_drive_controller(robot_prim_path: str = ROBOT_PRIM_PATH, robot_move_speed: float = ROBOT_MOVE_SPEED, robot_turn_speed: float = ROBOT_TURN_SPEED) -> RobotDriveController:
     global _drive_controller
     if _drive_controller is None:
-        _drive_controller = RobotDriveController()
+        _drive_controller = RobotDriveController(robot_prim_path, robot_move_speed, robot_turn_speed)
     return _drive_controller

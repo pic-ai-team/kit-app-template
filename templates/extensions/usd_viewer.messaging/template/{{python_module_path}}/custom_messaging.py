@@ -35,6 +35,7 @@ class CustomMessageManager:
         self._timeline = get_timeline_interface()
         self._viewport_capture = ViewportCapture()
         self._agent_client = AgentClient(base_url=agent_backend_url)
+        self._agent_backend_url = agent_backend_url.rstrip('/')
         self._usd_spawner = UsdSpawner()
         self._fire_manager = FireIncidentManager()
         self._robot_controller = get_robot_controller()
@@ -2076,6 +2077,7 @@ class CustomMessageManager:
         if not self._robot_controller:
             self._robot_controller = get_robot_controller()
         self._robot_controller.initialize()
+        self._robot_controller.start_camera_stream(backend_url=self._agent_backend_url)
         self._robot_controller.set_on_status(self._push_robot_status)
 
     def _push_robot_status(self, status: Dict[str, Any]):
@@ -2151,7 +2153,8 @@ class CustomMessageManager:
         quality = int(payload.get('quality', 50))
 
         async def _do():
-            result = await self._robot_controller.capture_frame(width=width, quality=quality)
+            # Capture low resolution camera frame to send over webRTC
+            result = await self._robot_controller.capture_frame_low_res(width=width, quality=quality)
             get_eventdispatcher().dispatch_event("robotCaptureResponse", payload=result)
 
         asyncio.ensure_future(_do())

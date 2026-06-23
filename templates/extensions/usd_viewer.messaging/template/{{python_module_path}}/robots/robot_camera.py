@@ -12,6 +12,7 @@ The camera pose is derived from the robot prim's position + its
 import asyncio
 import base64
 import io
+import time
 from typing import Optional
 
 import carb
@@ -20,22 +21,40 @@ from .robot_drive_controller import (
     ROBOT_PRIM_PATH,
 )
 
-# Resolution for robot camera captures
-ROBOT_CAM_WIDTH = 250
-ROBOT_CAM_HEIGHT = 175
+# Default low-impact robot camera stream resolution
+ROBOT_STREAM_WIDTH = 300
+ROBOT_STREAM_HEIGHT = 300
+ROBOT_STREAM_FPS = 0.5
+ROBOT_STREAM_QUALITY = 60
 
 
 class RobotCamera:
     """Captures a snapshot from the robot's virtual camera viewpoint."""
 
-    ROBOT_CAMERA_PATH = ROBOT_PRIM_PATH + "/Camera"
+    
 
-    def __init__(self):
+    def __init__(self, robot_prim_path: str = ROBOT_PRIM_PATH):
         self._capturing = False
         self._hydra_texture = None
         self._drawable_sub = None
-        self._hydra_size = (ROBOT_CAM_WIDTH, ROBOT_CAM_HEIGHT)
+        self.robot_camera_path = robot_prim_path + "/Camera"
+        self._hydra_size = (ROBOT_STREAM_WIDTH, ROBOT_STREAM_HEIGHT)
         self._capture_state = None  # {"future": asyncio.Future, "skip": int}
+        self._camera_created = False
+
+        # Continuous robot camera stream (Kit -> backend)
+        self._stream_task: Optional[asyncio.Task] = None
+        self._stream_running = False
+        self._stream_backend_url = "http://localhost:8000"
+        self._stream_camera_id = "robot_cam_1"
+        self._stream_width = ROBOT_STREAM_WIDTH
+        self._stream_height = ROBOT_STREAM_HEIGHT
+        self._stream_quality = ROBOT_STREAM_QUALITY
+        self._stream_fps = ROBOT_STREAM_FPS
+        self._last_stream_frame_b64: Optional[str] = None
+        self._last_stream_frame_ts: Optional[float] = None
+        self._last_stream_push_ok = False
+        self._last_stream_error: Optional[str] = None
 
     # ------------------------------------------------------------------
     # USD camera prim
@@ -46,15 +65,15 @@ class RobotCamera:
             import omni.usd
 
             stage = omni.usd.get_context().get_stage()
-            if stage is None:
-                carb.log_error("[RobotCamera] USD stage not available")
+            if stage is None or stage.GetRootLayer().anonymous:
+                carb.log_warn("[RobotCamera] USD stage not available")
                 return False
 
-            prim = stage.GetPrimAtPath(self.ROBOT_CAMERA_PATH)
+            prim = stage.GetPrimAtPath(self.robot_camera_path)
             if prim and prim.IsValid():
                 return True
             else:
-                carb.log_error(f"[RobotCamera] Camera prim at {self.ROBOT_CAMERA_PATH} is invalid")
+                carb.log_error(f"[RobotCamera] Camera prim at {self.robot_camera_path} is invalid")
                 return False
         except Exception as e:
             carb.log_error(f"[RobotCamera] Error accessing USD stage when checking robot camera prim: {e}")
@@ -77,7 +96,7 @@ class RobotCamera:
                 width=self._hydra_size[0],
                 height=self._hydra_size[1],
                 usd_context_name="",
-                usd_camera_path=self.ROBOT_CAMERA_PATH,
+                usd_camera_path=self.robot_camera_path,
                 hydra_engine_name="rtx",
                 is_async=True,
             )
@@ -210,10 +229,10 @@ class RobotCamera:
     # Public capture API
     # ------------------------------------------------------------------
 
-    async def capture_frame(
+    async def capture_frame_low_res(
         self,
-        width: int = 250,
-        quality: int = 50,
+        width: int = ROBOT_STREAM_WIDTH,
+        quality: int = ROBOT_STREAM_QUALITY,
     ) -> Optional[str]:
         """
         Capture a frame from the robot's viewpoint using off-screen rendering.
@@ -227,7 +246,7 @@ class RobotCamera:
 
         self._capturing = True
         try:
-            return await self._do_capture(width, quality)
+            return await self._do_capture_low_res(width, quality)
         finally:
             self._capturing = False
 
@@ -262,56 +281,8 @@ class RobotCamera:
         finally:
             self._capturing = False
 
-    async def _do_capture_full_res(
-        self, width: int, height: int, quality: int
-    ) -> Optional[str]:
-        if not self._is_robot_camera():
-            return None
-
-        # Switch to the requested resolution
-        if self._hydra_size != (width, height):
-            if not self._recreate_hydra_texture(width, height):
-                carb.log_warn("[RobotCamera] HydraTexture unavailable at requested resolution")
-                return None
-        else:
-            if not self._ensure_hydra_texture():
-                carb.log_warn("[RobotCamera] HydraTexture unavailable")
-                return None
-
-        # Wait for USD pose propagation
-        await asyncio.sleep(0.15)
-
-        loop = asyncio.get_event_loop()
-        future = loop.create_future()
-        self._capture_state = {"future": future, "skip": 3}
-
-        try:
-            frame_b64 = await asyncio.wait_for(future, timeout=15.0)
-        except asyncio.TimeoutError:
-            carb.log_warn("[RobotCamera] Full-res capture timed out (15s)")
-            frame_b64 = None
-        finally:
-            self._capture_state = None
-
-        # Restore default thumbnail resolution for normal captures
-        if self._hydra_size != (ROBOT_CAM_WIDTH, ROBOT_CAM_HEIGHT):
-            self._recreate_hydra_texture(ROBOT_CAM_WIDTH, ROBOT_CAM_HEIGHT)
-
-        if not frame_b64:
-            return None
-
-        # Re-encode at requested quality without downscaling
-        return _reencode_jpeg(frame_b64, quality)
-
-    async def _do_capture(self, width: int, quality: int) -> Optional[str]:
-        if not self._is_robot_camera():
-            return None
-
-        use_hydra = self._ensure_hydra_texture()
-        if not use_hydra:
-            carb.log_warn("[RobotCamera] HydraTexture unavailable")
-            return None
-
+    async def _wait_for_next_frame(self) -> Optional[str]:
+        """Core async loop to wait for the next valid Hydra frame."""
         # Wait briefly for USD pose propagation
         await asyncio.sleep(0.1)
 
@@ -327,21 +298,67 @@ class RobotCamera:
         finally:
             self._capture_state = None
 
+        return frame_b64
+
+    async def _do_capture_full_res(
+        self, width: int, height: int, quality: int
+    ) -> Optional[str]:
+        if not self._is_robot_camera():
+            return None
+
+        # 1. Setup requested resolution
+        if self._hydra_size != (width, height):
+            if not self._recreate_hydra_texture(width, height):
+                carb.log_warn("[RobotCamera] HydraTexture unavailable at requested resolution")
+                return None
+        else:
+            if not self._ensure_hydra_texture():
+                carb.log_warn("[RobotCamera] HydraTexture unavailable")
+                return None
+
+        # 2. Wait for the frame
+        frame_b64 = await self._wait_for_next_frame()
+
+        # 3. Teardown / Restore default thumbnail resolution
+        if self._hydra_size != (ROBOT_STREAM_WIDTH, ROBOT_STREAM_HEIGHT):
+            self._recreate_hydra_texture(ROBOT_STREAM_WIDTH, ROBOT_STREAM_HEIGHT)
+
         if not frame_b64:
             return None
 
-        return _make_thumbnail(frame_b64, width, quality)
+        # 4. Post-process
+        return _reencode_jpeg(frame_b64, quality)
 
+
+    async def _do_capture_low_res(self, width: int, quality: int) -> Optional[str]:
+        if not self._is_robot_camera():
+            return None
+
+        # 1. Setup standard resolution
+        if not self._ensure_hydra_texture():
+            carb.log_warn("[RobotCamera] HydraTexture unavailable")
+            return None
+
+        # 2. Wait for the frame
+        frame_b64 = await self._wait_for_next_frame()
+
+        if not frame_b64:
+            return None
+
+        # 3. Post-process
+        return _make_thumbnail(frame_b64, width, quality)
+    
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
     def shutdown(self):
         """Clean up render targets and camera resources."""
+        self.stop_backend_stream()
         self._drawable_sub = None
         self._capture_state = None
         self._hydra_texture = None
-        self._hydra_size = (ROBOT_CAM_WIDTH, ROBOT_CAM_HEIGHT)
+        self._hydra_size = (ROBOT_STREAM_WIDTH, ROBOT_STREAM_HEIGHT)
 
         if self._camera_created:
             try:
@@ -354,6 +371,174 @@ class RobotCamera:
             except Exception:
                 pass
             self._camera_created = False
+
+    # ------------------------------------------------------------------
+    # Continuous stream (Kit -> backend)
+    # ------------------------------------------------------------------
+
+    def configure_backend_stream(
+        self,
+        backend_url: str,
+        fps: float = ROBOT_STREAM_FPS,
+        width: int = ROBOT_STREAM_WIDTH,
+        height: int = ROBOT_STREAM_HEIGHT,
+        quality: int = ROBOT_STREAM_QUALITY,
+        camera_id: str = "robot_cam_1",
+    ) -> None:
+        """Configure stream target and capture parameters."""
+        if backend_url:
+            self._stream_backend_url = backend_url.rstrip("/")
+        self._stream_fps = max(0.1, float(fps))
+        self._stream_width = max(64, int(width))
+        self._stream_height = max(64, int(height))
+        self._stream_quality = max(1, min(100, int(quality)))
+        self._stream_camera_id = camera_id or "robot_cam_1"
+
+    def start_backend_stream(self) -> bool:
+        """Start continuous robot camera streaming to the backend."""
+        if self._stream_running:
+            return True
+
+        self._stream_running = True
+        self._stream_task = asyncio.ensure_future(self._run_backend_stream_loop())
+        carb.log_info(
+            "[RobotCamera] Backend stream started: "
+            f"{self._stream_width}x{self._stream_height} @ {self._stream_fps:.2f}fps -> "
+            f"{self._stream_backend_url}/api/robot/camera-frame"
+        )
+        return True
+
+    def stop_backend_stream(self) -> None:
+        """Stop continuous robot camera streaming."""
+        self._stream_running = False
+        if self._stream_task is not None:
+            self._stream_task.cancel()
+            self._stream_task = None
+
+    def get_stream_status(self) -> dict:
+        """Return current streaming health/state for diagnostics."""
+        age = None
+        if self._last_stream_frame_ts is not None:
+            age = max(0.0, time.time() - self._last_stream_frame_ts)
+
+        return {
+            "running": self._stream_running,
+            "backend_url": self._stream_backend_url,
+            "camera_id": self._stream_camera_id,
+            "fps": self._stream_fps,
+            "width": self._stream_width,
+            "height": self._stream_height,
+            "quality": self._stream_quality,
+            "last_frame_ts": self._last_stream_frame_ts,
+            "last_frame_age_sec": age,
+            "last_push_ok": self._last_stream_push_ok,
+            "last_error": self._last_stream_error,
+        }
+
+    def get_latest_stream_frame(self) -> Optional[str]:
+        """Return latest streamed frame for optional local preview endpoints."""
+        return self._last_stream_frame_b64
+
+    async def _run_backend_stream_loop(self) -> None:
+        """Capture/push loop designed to avoid queue buildup and render contention."""
+        interval = 1.0 / self._stream_fps
+
+        # capture_frame() creates the hydra texture one time
+        if self._hydra_texture is not None and self._hydra_size != (self._stream_width, self._stream_height):
+            self._recreate_hydra_texture(self._stream_width, self._stream_height)
+        else:
+            self._hydra_size = (self._stream_width, self._stream_height)
+
+        while self._stream_running:
+            tick_start = time.time()
+            try:
+                # Reuse existing capture path, but at low cadence and fixed resolution.
+                frame_b64 = await self.capture_frame_low_res(
+                    width=self._stream_width,
+                    quality=self._stream_quality,
+                )
+
+                if frame_b64:
+                    self._last_stream_frame_b64 = frame_b64
+                    self._last_stream_frame_ts = time.time()
+                    await self._push_frame_to_backend(frame_b64)
+                else:
+                    self._last_stream_push_ok = False
+                    self._last_stream_error = "capture returned empty frame"
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._last_stream_push_ok = False
+                self._last_stream_error = str(e)
+                carb.log_warn(f"[RobotCamera] stream loop error: {e}")
+
+            elapsed = time.time() - tick_start
+            await asyncio.sleep(max(0.0, interval - elapsed))
+
+        carb.log_info("[RobotCamera] Backend stream loop stopped")
+
+    async def _push_frame_to_backend(self, frame_b64: str) -> None:
+        """Push one frame to backend over HTTP JSON (robust + low-overhead)."""
+        payload = {
+            "camera_id": self._stream_camera_id,
+            "timestamp": time.time(),
+            "width": self._stream_width,
+            "height": self._stream_height,
+            "frame_data": frame_b64,
+            "source": "kit_robot_camera",
+        }
+        url = f"{self._stream_backend_url}/api/robot/camera-frame"
+
+        try:
+            import aiohttp
+
+            timeout = aiohttp.ClientTimeout(total=5.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload) as response:
+                    if response.status != 200:
+                        text = await response.text()
+                        self._last_stream_push_ok = False
+                        self._last_stream_error = f"backend push failed ({response.status}): {text}"
+                        carb.log_warn(f"[RobotCamera] {self._last_stream_error}")
+                        return
+
+            self._last_stream_push_ok = True
+            self._last_stream_error = None
+            return
+
+        except ImportError:
+            # Fallback for Kit runtimes without aiohttp.
+            import json as _json
+            import urllib.request
+
+            try:
+                data = _json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: urllib.request.urlopen(req, timeout=5.0),
+                )
+                self._last_stream_push_ok = response.status == 200
+                if not self._last_stream_push_ok:
+                    self._last_stream_error = f"backend push failed ({response.status})"
+                else:
+                    self._last_stream_error = None
+            except Exception as e:
+                self._last_stream_push_ok = False
+                self._last_stream_error = str(e)
+                carb.log_warn(f"[RobotCamera] backend push fallback failed: {e}")
+
+        except Exception as e:
+            self._last_stream_push_ok = False
+            self._last_stream_error = str(e)
+            carb.log_warn(f"[RobotCamera] backend push failed: {e}")
 
 
 # ------------------------------------------------------------------
@@ -447,8 +632,8 @@ def _reencode_jpeg(b64_jpeg: str, quality: int) -> Optional[str]:
 _robot_camera: Optional[RobotCamera] = None
 
 
-def get_robot_camera() -> RobotCamera:
+def get_robot_camera(robot_prim_path: str = ROBOT_PRIM_PATH) -> RobotCamera:
     global _robot_camera
     if _robot_camera is None:
-        _robot_camera = RobotCamera()
+        _robot_camera = RobotCamera(robot_prim_path=robot_prim_path)
     return _robot_camera
