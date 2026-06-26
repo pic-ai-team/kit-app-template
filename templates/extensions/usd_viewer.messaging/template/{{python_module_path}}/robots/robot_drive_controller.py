@@ -302,6 +302,21 @@ class RobotDriveController:
         except Exception as e:
             carb.log_error(f"[RobotDrive] get_position failed: {e}")
             return None
+        
+    def get_base_position(self):
+        """Get the starting position and orientation of the robot.
+
+        Returns:
+            tuple: A tuple containing (location, yaw), where:
+                - x (float): The x coordinate in cm.
+                - y (float): The y coordinate in cm.
+                - yaw (float): The robot orientation offset (always 0)
+        """
+        if self._initial_position:
+            x, y = self._initial_position[0], self._initial_position[1]
+            return x, y, 0
+        else:
+            return False
 
     def _get_xform_ops(self):
         """Get translate and rotateY ops for the robot, creating if needed."""
