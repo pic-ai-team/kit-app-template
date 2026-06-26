@@ -42,6 +42,9 @@ ROBOT_PREFIX = "robot_"
 # Prefix for robot shelf analysis routes
 ROBOT_SHELF_ANALYSIS_PREFIX = "robot_shelf_analysis_"
 
+# Prefix for robot incident detection routes
+ROBOT_INCIDENT_DETECTION_PREFIX = "robot_incident_detection_"
+
 # Import robot from robot config
 ROBOT_CONFIG_DATA = {}
 current_dir = Path(__file__).parent
@@ -134,7 +137,7 @@ class RobotController:
             width=self.config.get("robot_stream_width", 300),
             height=self.config.get("robot_stream_height", 300),
             quality=self.config.get("robot_stream_quality", 60),
-            camera_id=f"{self.robot_id}",
+            robot_id=f"{self.robot_id}",
         )
         self._camera.start_backend_stream()
 
@@ -186,7 +189,7 @@ class RobotController:
             width=self.config.get("robot_stream_width", 300),
             height=self.config.get("robot_stream_height", 300),
             quality=self.config.get("robot_stream_quality", 60),
-            camera_id=f"{self.robot_id}",
+            robot_id=f"{self.robot_id}",
         )
         self._camera.start_backend_stream()
         return {
@@ -304,6 +307,18 @@ class RobotController:
         ok = self._drive.navigate_to(x, y, target_yaw=yaw)
         return {"ok": ok, "target": [x, y], "yaw": yaw}
 
+    def return_to_base(self) -> Dict[str, Any]:
+        """Navigate to the base of the robot"""
+        self._ensure_initialized()
+        # Rebuild the nav_mesh to avoid hitting trash (TODO Should be removed in the future since not applicable in reality)
+        self.build_nav_mesh()
+        self._route_queue = []
+        self._navigating_route = False
+        
+        x, y, init_yaw = self._drive.get_base_position()
+        carb.log_error(f"init_yaw: {init_yaw}")
+        ok = self._drive.navigate_to(x, y, init_yaw)
+        return {"ok": ok, "target": [x, y], "yaw": init_yaw}
     # ------------------------------------------------------------------
     # Route navigation
     # ------------------------------------------------------------------
@@ -391,6 +406,13 @@ class RobotController:
         return {
             k: v for k, v in self._routes.items()
             if k.startswith(ROBOT_SHELF_ANALYSIS_PREFIX)
+        }
+    
+    def get_incident_detection_routes(self) -> Dict[str, Dict[str, Any]]:
+        """Return only routes with the robot_incident_detection_ prefix."""
+        return {
+            k: v for k, v in self._routes.items()
+            if k.startswith(ROBOT_INCIDENT_DETECTION_PREFIX)
         }
 
     # ------------------------------------------------------------------

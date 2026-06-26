@@ -35,6 +35,10 @@ class APIServer:
 
         GET  /robot/camera/status        — get robot camera stream status
         GET  /robot/camera/latest        — get latest robot camera frame
+        GET  /robot/navigation/stop      — stop the robot
+        GET  /robot/navigation/return    — let the robot navigate back to its base position
+        GET  /robot/navigation/route     — let the robot navigate along a route
+        GET  /robot/incident-detection/routes  - receive all incident detection routes
     """
 
     def __init__(self, port: int = DEFAULT_PORT):
@@ -61,10 +65,15 @@ class APIServer:
         app = web.Application()
         app.router.add_get("/cctv/capture", self._handle_capture)
         app.router.add_get("/cctv/positions", self._handle_positions)
+        app.router.add_get("/robot/status", self._handle_robot_status)
+        app.router.add_post("/robot/navigation/stop", self._handle_stop_robot)
+        app.router.add_post("/robot/navigation/return", self._handle_navigate_robot_to_base)
+        app.router.add_post("/robot/navigation/route", self._handle_robot_navigate_route)
         app.router.add_get("/robot/shelf-analysis", self._handle_shelf_analysis)
         app.router.add_get("/robot/shelf-analysis/routes", self._handle_shelf_analysis_routes)
         app.router.add_get("/robot/camera/status", self._handle_robot_camera_status)
         app.router.add_get("/robot/camera/latest", self._handle_robot_camera_latest)
+        app.router.add_get("/robot/incident-detection/routes", self._handle_incident_detection_routes)
         app.router.add_get("/health", self._handle_health)
 
         self._runner = web.AppRunner(app)
@@ -180,7 +189,7 @@ class APIServer:
         stock_level, shelf_levels with product stock ratios.
         """
         from aiohttp import web
-
+                            
         route = request.query.get("route", "").strip()
         if not route:
             return web.json_response(
@@ -282,13 +291,142 @@ class APIServer:
                 status=500,
             )
 
-    async def _handle_robot_camera_status(self, request):
-        """Return Kit-side robot camera stream state."""
+    # ------------------------------------------------------------------
+    # Robot Incident Detection Endpoints
+    # ------------------------------------------------------------------    
+    async def _handle_incident_detection_routes(self, request):
+        """
+        List available robot incident detection routes.
+
+        Returns JSON:
+            {
+                "routes": {
+                    "robot_incident_detection_snacks": {"waypoints": [...]},
+                    ...
+                },
+                "count": N
+            }
+        """
         from aiohttp import web
 
         try:
+            mgr = None
+            try:
+                from . import custom_messaging as _cm_mod
+                mgr = getattr(_cm_mod, '_manager_instance', None)
+            except Exception:
+                pass
+
+            if mgr is None:
+                return web.json_response(
+                    {"error": "CustomMessageManager not available", "routes": {}, "count": 0},
+                    status=503,
+                )
+
+            # Initialize robot controller and reload routes from disk
+            mgr._init_robot()
+            mgr._robot_controller.reload_from_disk()
+            routes = mgr._robot_controller.get_incident_detection_routes()
+
+            return web.json_response({
+                "routes": {
+                    name: {"waypoint_count": len(data.get("waypoints", []))}
+                    for name, data in routes.items()
+                },
+                "count": len(routes),
+            })
+
+        except Exception as e:
+            carb.log_error(f"[APIServer] Incident detection routes error: {e}")
+            import traceback
+            carb.log_error(traceback.format_exc())
+            return web.json_response(
+                {"error": str(e), "routes": {}, "count": 0},
+                status=500,
+            )
+
+    async def _handle_robot_navigate_route(self, request):
+        """
+        Command the robot to navigate a specified route.
+
+        Expects JSON body:
+            {
+                "route": "robot_shelf_analysis_snacks"
+            }
+        """
+        from aiohttp import web
+
+        try:
+            data = await request.json()
+            route = data.get("route", "").strip()
+            if not route:
+                return web.json_response(
+                    {"success": False, "error": "'route' field is required in JSON body"},
+                    status=400,
+                )
+
             from .robots.robot_controller import get_robot_controller
 
+            rc = get_robot_controller()
+            rc.initialize()
+            navigation_result = rc.navigate_route(route)  # This will run in background and update robot state
+
+            return web.json_response(navigation_result)
+
+        except Exception as e:
+            carb.log_error(f"[APIServer] Robot navigate route error: {e}")
+            import traceback
+            carb.log_error(traceback.format_exc())
+            return web.json_response(
+                {"success": False, "error": str(e)},
+                status=500,
+            )
+
+    async def _handle_robot_status(self, request):
+        """Return current robot status."""
+        from aiohttp import web
+        try:
+            from .robots.robot_controller import get_robot_controller
+            rc = get_robot_controller()
+            rc.initialize()
+            status = rc.get_status()
+            return web.json_response(status)
+        except Exception as e:
+            carb.log_error(f"[APIServer] Robot status error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+    
+    async def _handle_stop_robot(self, request):
+        """Stop robot movement."""
+        from aiohttp import web
+        try:
+            from .robots.robot_controller import get_robot_controller
+            rc = get_robot_controller()
+            rc.initialize()
+            result = rc.stop()
+            return web.json_response(result)
+        except Exception as e:
+            carb.log_error(f"[APIServer] Robot couldn't be stopped: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+        
+    async def _handle_navigate_robot_to_base(self, request):
+        """Let the robot navigate back to base."""
+        from aiohttp import web
+        try:
+            from .robots.robot_controller import get_robot_controller
+            rc = get_robot_controller()
+            rc.initialize()
+            rc.stop()
+            result = rc.return_to_base()
+            return web.json_response(result)
+        except Exception as e:
+            carb.log_error(f"[APIServer] Robot couldn't return to base: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_robot_camera_status(self, request):
+        """Return Kit-side robot camera stream state."""
+        from aiohttp import web
+        try:
+            from .robots.robot_controller import get_robot_controller
             rc = get_robot_controller()
             rc.initialize()
             status = rc.get_camera_stream_status()
@@ -300,7 +438,6 @@ class APIServer:
     async def _handle_robot_camera_latest(self, request):
         """Return latest Kit-side robot frame (base64 JPEG + metadata)."""
         from aiohttp import web
-
         try:
             from .robots.robot_camera import get_robot_camera
 
@@ -320,7 +457,7 @@ class APIServer:
             return web.json_response(
                 {
                     "ok": True,
-                    "camera_id": status.get("camera_id"),
+                    "robot_id": status.get("robot_id"),
                     "timestamp": status.get("last_frame_ts"),
                     "width": status.get("width"),
                     "height": status.get("height"),

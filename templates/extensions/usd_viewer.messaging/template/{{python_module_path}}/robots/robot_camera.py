@@ -46,7 +46,7 @@ class RobotCamera:
         self._stream_task: Optional[asyncio.Task] = None
         self._stream_running = False
         self._stream_backend_url = "http://localhost:8000"
-        self._stream_camera_id = "robot_cam_1"
+        self._stream_robot_id = "robot_1"
         self._stream_width = ROBOT_STREAM_WIDTH
         self._stream_height = ROBOT_STREAM_HEIGHT
         self._stream_quality = ROBOT_STREAM_QUALITY
@@ -383,7 +383,7 @@ class RobotCamera:
         width: int = ROBOT_STREAM_WIDTH,
         height: int = ROBOT_STREAM_HEIGHT,
         quality: int = ROBOT_STREAM_QUALITY,
-        camera_id: str = "robot_cam_1",
+        robot_id: str = "robot_1"
     ) -> None:
         """Configure stream target and capture parameters."""
         if backend_url:
@@ -392,7 +392,7 @@ class RobotCamera:
         self._stream_width = max(64, int(width))
         self._stream_height = max(64, int(height))
         self._stream_quality = max(1, min(100, int(quality)))
-        self._stream_camera_id = camera_id or "robot_cam_1"
+        self._stream_robot_id = robot_id
 
     def start_backend_stream(self) -> bool:
         """Start continuous robot camera streaming to the backend."""
@@ -424,7 +424,7 @@ class RobotCamera:
         return {
             "running": self._stream_running,
             "backend_url": self._stream_backend_url,
-            "camera_id": self._stream_camera_id,
+            "robot_id": self._stream_robot_id,
             "fps": self._stream_fps,
             "width": self._stream_width,
             "height": self._stream_height,
@@ -481,7 +481,7 @@ class RobotCamera:
     async def _push_frame_to_backend(self, frame_b64: str) -> None:
         """Push one frame to backend over HTTP JSON (robust + low-overhead)."""
         payload = {
-            "camera_id": self._stream_camera_id,
+            "robot_id": self._stream_robot_id,
             "timestamp": time.time(),
             "width": self._stream_width,
             "height": self._stream_height,
