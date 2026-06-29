@@ -65,6 +65,8 @@ class CustomMessageManager:
         self._camera_broadcast_running = False
         self._last_broadcast_camera: Optional[Dict[str, Any]] = None
 
+        self._infographics_dir = ""
+
         carb.log_info("[CustomMessageManager] Initializing...")
 
         # ===== REGISTER OUTGOING MESSAGES (Kit -> Web Client) =====
@@ -141,6 +143,7 @@ class CustomMessageManager:
             'setMarkersOnlySelection': self._on_set_markers_only_selection,
             'startMarkerPlacement':    self._on_start_marker_placement,
             'cancelMarkerPlacement':   self._on_cancel_marker_placement,
+            'updateMarkerPosition':    self._on_update_marker_position,
             'saveNavMarkerHere':       self._on_save_nav_marker_here,
             'startCameraBroadcast':    self._on_start_camera_broadcast,
             'stopCameraBroadcast':     self._on_stop_camera_broadcast,
@@ -152,6 +155,8 @@ class CustomMessageManager:
             'joystickMove':         self._on_joystick_move,
             # Nav marker placement offsets
             'setNavMarkerOffsets':  self._on_set_nav_marker_offsets,
+            # Infographics config
+            'setInfographicsDir':   self._on_set_infographics_dir,
         }
 
         ed = get_eventdispatcher()
@@ -1594,15 +1599,16 @@ class CustomMessageManager:
 
     def _on_click_marker(self, event: carb.events.IEvent) -> None:
         key = event.payload.get("key", "").strip()
+        skip_capture = event.payload.get("skip_capture", False)
         if key not in self._markers:
             carb.log_warn(f"[CustomMessageManager] clickMarker: key '{key}' not found")
             return
 
         marker = self._markers[key]
         carb.log_info(f"[CustomMessageManager] clickMarker '{key}' — navigating + querying agent")
-        asyncio.ensure_future(self._do_click_marker(key, marker))
+        asyncio.ensure_future(self._do_click_marker(key, marker, skip_capture=skip_capture))
 
-    async def _do_click_marker(self, key: str, marker: Dict[str, Any]) -> None:
+    async def _do_click_marker(self, key: str, marker: Dict[str, Any], skip_capture: bool = False) -> None:
         label    = marker.get("label", key)
         description = marker.get("description", "")
         position = marker.get("position", [0, 0, 0])
@@ -1634,11 +1640,39 @@ class CustomMessageManager:
                 final_img_url = None
                 thumbnail_b64 = None
 
-                if image_url:
-                    final_img_url = image_url
-                else:
-                    # Capture viewport as the infographic
-                    frame_data = await self._viewport_capture.capture_frame_async(width=1280, height=720)
+                if not skip_capture:
+                    if image_url:
+                        import os
+                        import base64
+                        # Try to load the file if it is not already a URL/Data URI
+                        if not image_url.startswith("http") and not image_url.startswith("data:"):
+                            # Possible paths to check: configured dir, or relative to markers.json
+                            search_paths = []
+                            if self._infographics_dir:
+                                search_paths.append(os.path.join(self._infographics_dir, image_url))
+                            
+                            # Fallback to the extension directory (same dir as markers.json)
+                            if getattr(self, '_markers_file', None):
+                                search_paths.append(os.path.join(os.path.dirname(self._markers_file), image_url))
+                            
+                            for file_path in search_paths:
+                                if os.path.exists(file_path):
+                                    try:
+                                        with open(file_path, "rb") as f:
+                                            img_data = f.read()
+                                            b64_str = base64.b64encode(img_data).decode('utf-8')
+                                            ext = os.path.splitext(image_url)[1].lower()
+                                            mime = "image/png" if ext == ".png" else "image/jpeg"
+                                            final_img_url = f"data:{mime};base64,{b64_str}"
+                                            break  # Found and loaded successfully
+                                    except Exception as e:
+                                        carb.log_error(f"[CustomMessageManager] Failed to read infographic {file_path}: {e}")
+                        
+                        if not final_img_url:
+                            final_img_url = image_url
+                    else:
+                        # Capture viewport as the infographic
+                        frame_data = await self._viewport_capture.capture_frame_async(width=1280, height=720)
                     if frame_data:
                         thumbnail_b64, _ = self._compress_planogram_frame(frame_data)
                         if thumbnail_b64:
@@ -1896,11 +1930,15 @@ class CustomMessageManager:
                     carb.log_info(f"[CustomMessageManager] 3D waypoint clicked: '{key}'")
                     selection.clear_selected_prim_paths()
                     marker = self._markers[key]
-                    # Send immediate loading state to browser
-                    get_eventdispatcher().dispatch_event(
-                        "markerInfoResponse",
-                        payload={"key": key, "label": marker.get("label", key), "message": "", "loading": True}
-                    )
+                    
+                    m_type = marker.get("type", "navigation")
+                    if m_type == "info":
+                        # Send immediate loading state to browser
+                        get_eventdispatcher().dispatch_event(
+                            "markerInfoResponse",
+                            payload={"key": key, "label": marker.get("label", key), "message": "", "loading": True}
+                        )
+
                     asyncio.ensure_future(self._do_click_marker(key, marker))
                     return
         except Exception as e:
@@ -1958,6 +1996,66 @@ class CustomMessageManager:
             except Exception as e:
                 carb.log_warn(f"[CustomMessageManager] set_pickable re-lock failed: {e}")
         carb.log_info("[CustomMessageManager] Marker placement cancelled")
+
+    def _on_update_marker_position(self, event: carb.events.IEvent) -> None:
+        """Move an existing marker to a new absolute world position.
+
+        Expected payload: { key: str, position: [x, y, z] }
+        The browser sends this from the position fine-tune editor (-50/-10/-1/+1/+10/+50 nudge buttons).
+        Updates the in-memory dict, moves the USD prim translate op, saves to disk, and
+        dispatches markersResponse so the badge overlay re-projects to the new world position.
+        """
+        payload = event.payload or {}
+        key = payload.get("key", "").strip()
+        position = payload.get("position")
+
+        if not key or not isinstance(position, (list, tuple)) or len(position) < 3:
+            carb.log_warn(f"[Markers] updateMarkerPosition: invalid payload: {payload}")
+            return
+
+        if key not in self._markers:
+            carb.log_warn(f"[Markers] updateMarkerPosition: unknown key '{key}'")
+            return
+
+        pos = [float(position[0]), float(position[1]), float(position[2])]
+        self._markers[key]["position"] = pos
+        self._move_marker_prim(key, pos)
+        self._save_markers()
+        self._dispatch_markers()
+        carb.log_info(f"[Markers] updateMarkerPosition '{key}' → {[round(p, 1) for p in pos]}")
+
+    def _move_marker_prim(self, key: str, position: list) -> None:
+        """Move an existing marker prim's translate op to the given world position.
+        Only updates the translate op — does not recreate any geometry.
+        """
+        try:
+            import omni.usd
+            from pxr import UsdGeom, Gf, Usd
+
+            stage = omni.usd.get_context().get_stage()
+            if not stage:
+                return
+
+            prim_path = f"{self.WAYPOINTS_ROOT}/{key}"
+            prim = stage.GetPrimAtPath(prim_path)
+            if not prim or not prim.IsValid():
+                carb.log_warn(f"[Markers] _move_marker_prim: prim not found: {prim_path}")
+                return
+
+            xform = UsdGeom.Xformable(prim)
+            translate_op = next(
+                (op for op in xform.GetOrderedXformOps()
+                 if op.GetOpType() == UsdGeom.XformOp.TypeTranslate),
+                None
+            )
+            if translate_op is None:
+                # Prim has no translate op yet (shouldn't happen) — add one
+                translate_op = UsdGeom.Xform(prim).AddTranslateOp()
+
+            translate_op.Set(Gf.Vec3d(position[0], position[1], position[2]))
+            carb.log_info(f"[Markers] Moved prim '{key}' to {[round(p, 1) for p in position]}")
+        except Exception as e:
+            carb.log_error(f"[Markers] _move_marker_prim '{key}': {e}")
 
     def _on_save_nav_marker_here(self, event: carb.events.IEvent) -> None:
         """Save a navigation marker at the current camera position."""
@@ -2151,9 +2249,14 @@ class CustomMessageManager:
         if "forward" in payload:
             self._nav_forward_offset = float(payload["forward"])
         carb.log_info(
-            f"[CustomMessageManager] Nav offsets — lift={self._nav_beacon_lift} "
             f"forward={self._nav_forward_offset}"
         )
+
+    def _on_set_infographics_dir(self, event: carb.events.IEvent) -> None:
+        """Set the base directory for infographic images."""
+        payload = getattr(event, "payload", {}) or {}
+        self._infographics_dir = payload.get("path", "").strip()
+        carb.log_info(f"[CustomMessageManager] Infographics directory set to: '{self._infographics_dir}'")
 
     async def _camera_broadcast_loop(self) -> None:
         while self._camera_broadcast_running:
