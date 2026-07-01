@@ -146,7 +146,7 @@ class StageManager:
                     "is_last_chunk": chunk_index == total_chunks - 1,
                 }
                 message_bus.dispatch(event_type, payload=payload)
-                message_bus.pump()
+                # message_bus.pump() removed — causes RecursionError when called inside an event handler
 
     def _on_select_prims(self, event: carb.events.IEvent) -> None:
         """
@@ -194,7 +194,7 @@ class StageManager:
                 payload = {"prims": omni.usd.get_context().get_selection().
                            get_selected_prim_paths()}
                 message_bus.dispatch(event_type, payload=payload)
-                message_bus.pump()
+                # message_bus.pump() removed — causes RecursionError when called inside an event handler
                 carb.log_info(f"Selection changed: Path to USD prims currently selected = {omni.usd.get_context().get_selection().get_selected_prim_paths()}")
 
         elif event.type == int(omni.usd.StageEventType.OPENED):
@@ -246,7 +246,7 @@ class StageManager:
             message_bus = omni.kit.app.get_app().get_message_bus_event_stream()
             event_type = carb.events.type_from_string("resetStageResponse")
             message_bus.dispatch(event_type, payload=payload)
-            message_bus.pump()
+            # message_bus.pump() removed — causes RecursionError when called inside an event handler
 
     def _on_make_pickable(self, event: carb.events.IEvent):
         """
@@ -274,7 +274,7 @@ class StageManager:
             else:
                 payload = {"result": "success", "error": ""}
             message_bus.dispatch(event_type, payload=payload)
-            message_bus.pump()
+            # message_bus.pump() removed — causes RecursionError when called inside an event handler
 
     def on_shutdown(self):
         """This is called every time the extension is deactivated. It is used
