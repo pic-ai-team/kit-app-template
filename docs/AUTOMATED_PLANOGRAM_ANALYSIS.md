@@ -47,7 +47,7 @@ For each waypoint in the route:
 1. **Navigate**: Robot navigates to waypoint via A* pathfinding on the nav mesh
 2. **Wait**: `navigate_to_and_wait()` blocks until the robot arrives (up to 120s timeout)
 3. **Capture**: High-res frame (400×1000, Q90) from robot's on-board camera
-4. **Identify**: POST frame to `/api/identify-shelf-products` → `asset_keys`, `product_info`, `rack_id`
+4. **Identify**: POST frame to `/api/vision/identify-shelf-products` → `asset_keys`, `product_info`, `rack_id`
 5. **Detect rows**: `usd_spawner.detect_rows_for_key()` per product (floor_z clustering)
 6. **Return**: Robot returns to initial position via `reset()`
 

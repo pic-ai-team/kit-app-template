@@ -968,7 +968,7 @@ class CustomMessageManager:
         """
         Full pipeline:
         1. Capture viewport frame
-        2. POST to /api/identify-shelf-products → list of asset_keys + product_info
+        2. POST to /api/vision/identify-shelf-products → list of asset_keys + product_info
         3. For each key, call usd_spawner.detect_rows_for_key()
         4. Merge per-product rows into unified shelf levels by floor_z
         5. Enrich with stock / initial_stock from product_info
@@ -998,7 +998,7 @@ class CustomMessageManager:
         # 2. Identify products (skipped in refresh mode when asset_keys already known)
         if not asset_keys:
             backend = self._agent_client._base_url
-            url     = f"{backend}/api/identify-shelf-products"
+            url     = f"{backend}/api/vision/identify-shelf-products"
             body    = _json.dumps({"frame_data": vision_b64, "model": model}).encode("utf-8")
             try:
                 loop = asyncio.get_event_loop()
@@ -1154,7 +1154,7 @@ class CustomMessageManager:
         For each waypoint:
         1. Navigate robot to waypoint and wait for arrival
         2. Capture high-res frame from robot camera (2000x2000, Q90)
-        3. POST to /api/identify-shelf-products → asset_keys + product_info + rack
+        3. POST to /api/vision/identify-shelf-products → asset_keys + product_info + rack
         4. Run row detection per product (reuse _merge_shelf_levels)
         5. Compute stock ratios using initial_stock from product_info
 
@@ -1250,7 +1250,7 @@ class CustomMessageManager:
                 continue
 
             # 3. Identify products via backend (enriched endpoint)
-            url = f"{backend}/api/identify-shelf-products"
+            url = f"{backend}/api/vision/identify-shelf-products"
             body = _json.dumps({"frame_data": frame_b64, "model": model}).encode("utf-8")
             try:
                 loop = asyncio.get_event_loop()
@@ -1490,7 +1490,7 @@ class CustomMessageManager:
         """POST a registered nav position to the agent backend."""
         import json as _json
         import urllib.request as _urllib
-        url = f"{self._agent_client._base_url}/api/nav-positions"
+        url = f"{self._agent_client._base_url}/api/navigation/positions"
         body = _json.dumps({
             "name": name, "description": description,
             "location": location, "rotation": rotation,
@@ -1511,7 +1511,7 @@ class CustomMessageManager:
     async def _delete_nav_position_from_backend(self, name: str) -> None:
         """DELETE a nav position from the agent backend."""
         import urllib.request as _urllib
-        url = f"{self._agent_client._base_url}/api/nav-positions/{name}"
+        url = f"{self._agent_client._base_url}/api/navigation/positions/{name}"
         try:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
@@ -1528,7 +1528,7 @@ class CustomMessageManager:
     async def _clear_nav_positions_from_backend(self) -> None:
         """DELETE all custom nav positions from the agent backend."""
         import urllib.request as _urllib
-        url = f"{self._agent_client._base_url}/api/nav-positions"
+        url = f"{self._agent_client._base_url}/api/navigation/positions"
         try:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(

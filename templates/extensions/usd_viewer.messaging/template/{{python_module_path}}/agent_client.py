@@ -202,7 +202,7 @@ class AgentClient:
                 frame_data, original_query, session_id, context, language
             )
 
-        url = f"{self._base_url}/api/analyze"
+        url = f"{self._base_url}/api/vision/analyze"
 
         payload = {
             "frame_data": frame_data,
@@ -250,7 +250,7 @@ class AgentClient:
         import urllib.request
         import urllib.error
 
-        url = f"{self._base_url}/api/analyze"
+        url = f"{self._base_url}/api/vision/analyze"
 
         payload = {
             "frame_data": frame_data,

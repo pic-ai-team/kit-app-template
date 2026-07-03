@@ -96,16 +96,19 @@ class StageManager:
                     continue
 
             child_name = child.GetName()
-            child_path = str(prim.GetPath())
+            child_path = str(child.GetPath())
             # Skipping over cameras
             if child_name.startswith('OmniverseKit_'):
                 continue
             # Also skipping rendering primitives.
             if prim_path == '/' and child_name == 'Render':
                 continue
-            child_path = child_path if child_path != '/' else ''
+            # Also skipping all store materials and furniture
+            if child_path.startswith("/World/_dstore") or child_path.startswith("/World/Floor"):
+                continue
+
             carb.log_info(f'child_path: {child_path}')
-            info = {"name": child_name, "path": f'{child_path}/{child_name}'}
+            info = {"name": child_name, "path": child_path}
 
             # We return an empty list here to indicate that children are
             # available, but the current app does not support pagination,

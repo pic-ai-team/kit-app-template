@@ -163,10 +163,10 @@ from `main.py`, Python would raise a circular import error. A neutral third modu
 
 | Method | Path | Action |
 |---|---|---|
-| `GET` | `/api/nav-positions` | Return all registered positions |
-| `POST` | `/api/nav-positions` | Register a position `{name, description, location, rotation}` |
-| `DELETE` | `/api/nav-positions/{name}` | Delete one position by name |
-| `DELETE` | `/api/nav-positions` | Clear all positions |
+| `GET` | `/api/navigation/positions` | Return all registered positions |
+| `POST` | `/api/navigation/positions` | Register a position `{name, description, location, rotation}` |
+| `DELETE` | `/api/navigation/positions/{name}` | Delete one position by name |
+| `DELETE` | `/api/navigation/positions` | Clear all positions |
 
 These endpoints are called by Kit's `_sync_nav_position_to_backend` / `_delete_nav_position_from_backend` /
 `_clear_nav_positions_from_backend` helpers whenever the user saves, deletes, or clears positions
@@ -237,7 +237,7 @@ Browser UI
   │  registerNavPosition ────────────────────────────► Kit
   │                           camera_navigation.save_position()
   │                           nav_presets.json updated
-  │                           _sync_nav_position_to_backend() ──► POST /api/nav-positions
+  │                           _sync_nav_position_to_backend() ──► POST /api/navigation/positions
   │  ◄────────────────────────────── navPositionsResponse (all positions)
   │
   │  navigateTo ─────────────────────────────────────► Kit

@@ -2084,6 +2084,10 @@ class UsdSpawner:
                 "position": {"x": float(position[0]), "y": float(position[1]), "z": float(position[2])},
                 "fire_params": dict(fire_params) if fire_params else {},
             })
+
+            # Call agent backend so it can notify the store manager (no body required)
+            self._send_to_backend("/api/fire-alert", "POST", {})
+
             return
 
         # Resolve incident type → asset key

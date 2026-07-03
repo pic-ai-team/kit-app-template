@@ -15,7 +15,7 @@ flowchart TB
 
     subgraph HOST["Host Machine"]
         subgraph AGENT_BACKEND["Agent Backend (FastAPI)"]
-            API["REST API\n/api/chat\n/api/analyze"]
+            API["REST API\n/api/chat\n/api/vision/analyze"]
             LANGGRAPH["LangGraph\nChat Pipeline"]
 
             subgraph AGENTS["AI Agents"]
@@ -322,7 +322,7 @@ sequenceDiagram
 
     API-->>CMM: action: capture_frame
     CMM->>CMM: ViewportCapture
-    CMM->>API: POST /api/analyze (with frame)
+    CMM->>API: POST /api/vision/analyze (with frame)
 
     API->>COS: Analyze image
     COS-->>API: Scene analysis + products detected
@@ -455,7 +455,7 @@ flowchart LR
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/api/chat` | POST | Process chat messages |
-| `/api/analyze` | POST | Analyze captured frames |
+| `/api/vision/analyze` | POST | Analyze captured frames |
 | `/api/session/{id}` | GET | Get session info |
 | `/api/products/search` | GET | Search product catalog |
 | `/health` | GET | Health check |
