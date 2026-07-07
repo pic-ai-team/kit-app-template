@@ -22,7 +22,7 @@ import omni.kit.app
 import omni.kit.livestream.messaging as messaging
 import omni.usd
 from carb.eventdispatcher import get_eventdispatcher
-from pxr import Gf, Usd, UsdGeom
+from pxr import Gf, Sdf, Usd, UsdGeom
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ _SHELF_ROWS_FILE  = _cfg.get("shelf_rows_file",  "/home/aicenter/adrian/local-om
 # These should be aisle / open-floor areas, NOT inside shelves.
 # Edit or extend this list to match your store layout.
 # ---------------------------------------------------------------------------
-_INCIDENT_SPAWN_ZONES: list[tuple[float, float, float, float]] = _cfg.get("incident_spawn_zones", 
+_INCIDENT_SPAWN_ZONES: list[tuple[float, float, float, float]] = _cfg.get("incident_spawn_zones",
 [
     [-80, -20, -200, 1000], # Main aisle
     [-620, -510, -180, 1400] # Drinks aisle
@@ -366,10 +366,13 @@ class UsdSpawner:
         # Persistent per-asset scale corrections (loaded from JSON).
         self._scale_corrections: dict = _load_scale_corrections()
 
+        # Tracking active incidents to be able to delete them incident_id -> prim_path
+        self._active_incidents: dict = {}
+
         # Register outgoing events
         for evt in ("spawnUsdResponse", "deleteUsdResponse", "replaceUsdResponse", "replaceAllUsdResponse",
                     "detectShelfRowsResponse", "replaceRowResponse",
-                    "incidentSpawnResponse", "incidentDeleteAllResponse"):
+                    "incidentSpawnResponse", "incidentDeleteAllResponse", "incidentDeleteResponse"):
             messaging.register_event_type_to_send(evt)
             omni.kit.app.register_event_alias(
                 carb.events.type_from_string(evt), evt
@@ -502,6 +505,19 @@ class UsdSpawner:
                 observer_name="UsdSpawner:incidentDeleteAllRequest",
                 event_name="incidentDeleteAllRequest",
                 on_event=self._on_incident_delete_all_request,
+            )
+        )
+
+        # Subscribe to incident delete request
+        omni.kit.app.register_event_alias(
+            carb.events.type_from_string("incidentDeleteRequest"),
+            "incidentDeleteRequest",
+        )
+        self._subscriptions.append(
+            get_eventdispatcher().observe_event(
+                observer_name="UsdSpawner:incidentDeleteRequest",
+                event_name="incidentDeleteRequest",
+                on_event=self._on_incident_delete_request,
             )
         )
 
@@ -1150,7 +1166,7 @@ class UsdSpawner:
                 carb.log_warn(f"[UsdSpawner] Could not update {inv_path}: {exc}")
 
         # Notify backend database
-        self._send_to_backend("/api/inventory", "DELETE", {
+        self._send_to_backend("/api/inventory/delete", "POST", {
             "prim_paths": list(prim_paths),
         })
 
@@ -2052,16 +2068,20 @@ class UsdSpawner:
             return Gf.Vec3d(x, z, floor_level)
         return Gf.Vec3d(x, floor_level, z)
 
-    def _on_incident_spawn_request(self, event) -> None:
+    def _on_incident_spawn_request(self, event) -> dict:
         """
+        Accepts either a carb.events.IEvent or a raw dictionary
+        Event:
         incidentSpawnRequest payload:
           { incident_type: "trash" | "spill" | "fire" | "random" }
+
+        Dict: { incident_type: "trash" | "spill" | "fire" | "random" }
 
         Spawns the corresponding incident asset at a random ground-level
         position within the configured spawn zones.
         Fire incidents are delegated to FireIncidentManager via fireIncidentRequest.
         """
-        payload = event.payload
+        payload = getattr(event, "payload", event)
         incident_type = str(payload.get("incident_type", "random"))
 
         carb.log_info(f"[UsdSpawner] incidentSpawnRequest  type={incident_type}")
@@ -2071,15 +2091,16 @@ class UsdSpawner:
             all_types = list(INCIDENT_ASSETS.keys()) + ["fire"]
             incident_type = random.choice(all_types)
 
+        # Create an incident_id
+        import time as _time
+        incident_id = f"{incident_type}_{int(_time.time() * 1000)}"
         # Fire incidents use Flow prims, not USD assets — delegate
         if incident_type == "fire":
-            import time as _time
-            fire_id = f"fire_{int(_time.time() * 1000)}"
             position = self._pick_random_ground_position()
             fire_params = payload.get("fire_params", {})
             get_eventdispatcher().dispatch_event("fireIncidentRequest", payload={
                 "action": "trigger",
-                "incident_id": fire_id,
+                "incident_id": incident_id,
                 "severity": "high",
                 "position": {"x": float(position[0]), "y": float(position[1]), "z": float(position[2])},
                 "fire_params": dict(fire_params) if fire_params else {},
@@ -2087,8 +2108,8 @@ class UsdSpawner:
 
             # Call agent backend so it can notify the store manager (no body required)
             self._send_to_backend("/api/fire-alert", "POST", {})
-
-            return
+            self._active_incidents[incident_id] = {"incident_type": "fire"}
+            return {"success": True, "incident_id": incident_id, "incident_type": incident_type}
 
         # Resolve incident type → asset key
         asset_key = INCIDENT_ASSETS.get(incident_type)
@@ -2100,7 +2121,7 @@ class UsdSpawner:
                          f"Valid types: {list(INCIDENT_ASSETS.keys()) + ['random']}",
                 "prim_path": "", "position": [0, 0, 0],
             })
-            return
+            return {"success": False}
 
         usd_path = ASSET_LIBRARY.get(asset_key)
         if not usd_path:
@@ -2109,7 +2130,7 @@ class UsdSpawner:
                 "error": f"No USD path for incident asset '{asset_key}'.",
                 "prim_path": "", "position": [0, 0, 0],
             })
-            return
+            return {"success": False}
 
         position = self._pick_random_ground_position()
 
@@ -2124,12 +2145,77 @@ class UsdSpawner:
                              round(position[2], 3)],
                 "error": "",
             })
+            self._active_incidents[incident_id] = {"incident_type": incident_type, "prim_path": prim_path}
+            return {"success": True, "incident_id": incident_id, "incident_type": incident_type}
         except Exception as exc:
             carb.log_error(f"[UsdSpawner] Incident spawn failed: {exc}")
             get_eventdispatcher().dispatch_event("incidentSpawnResponse", payload={
                 "result": "error", "error": str(exc),
                 "prim_path": "", "position": [0, 0, 0],
             })
+
+    def _on_incident_delete_request(self, event) -> None:
+        """
+        Accepts either a carb.events.IEvent or a raw dictionary
+        Event:
+        incidentDeleteRequest payload:
+          { incident_id: str}
+
+        Dict: { incident_id: str}
+
+
+        Deletes a spawned prim matching the given incident_id.
+        Fire incidents are delegated to FireIncidentManager via fireIncidentRequest.
+        """
+
+        payload = getattr(event, "payload", event)
+
+        incident_id = payload.get("incident_id")
+
+        if not incident_id:
+            carb.log_warn("[UsdSpawner] incidentDeleteRequest  incident_id missing")
+            return {"success": False}
+        if not self._active_incidents.get(incident_id):
+            carb.log_warn(f"[UsdSpawner] incidentDeleteRequest  incident_id={incident_id} is not registered as active incident")
+            return {"success": False}
+
+        incident = self._active_incidents.pop(incident_id)
+        incident_type = incident["incident_type"]
+        asset_key = INCIDENT_ASSETS.get(incident_type)
+
+        # Handle fire extinguishing
+        if incident_type == "fire":
+            get_eventdispatcher().dispatch_event("fireIncidentRequest", payload={"action": "extinguish", "incident_id": incident_id})
+            get_eventdispatcher().dispatch_event("incidentDeleteResponse", payload={
+                "result": "success", "count": 0, "deleted_paths": [],
+            })
+            return {"success": True}
+
+        # Other incidents require prim path for deletion
+        elif "prim_path" in incident:
+            stage = omni.usd.get_context().get_stage()
+            if stage:
+                prim = stage.GetPrimAtPath(incident["prim_path"])
+                if prim.IsValid():
+                    stage.RemovePrim(Sdf.Path(incident["prim_path"]))
+                    self._spawned_prims[asset_key] = [ prim_path for prim_path in self._spawned_prims[asset_key] if prim_path != incident["prim_path"]]
+                    self._inventory_remove([incident["prim_path"]])
+                    carb.log_info(f"[UsdSpawner] incident resolved: incident_type={incident_type} incident_id={incident_id}")
+                    get_eventdispatcher().dispatch_event("incidentDeleteResponse", payload={
+                        "result": "success",
+                        "count": 1,
+                        "deleted_paths": [incident["prim_path"]],
+                    })
+                    return {"success": True}
+
+        get_eventdispatcher().dispatch_event("incidentDeleteResponse", payload={
+            "result": "error",
+            "count": 0,
+            "deleted_paths": [],
+        })
+        carb.log_warn("[UsdSpawner] couldn't delete incident")
+        return {"success": False}
+
 
     def _on_incident_delete_all_request(self, event) -> None:
         """

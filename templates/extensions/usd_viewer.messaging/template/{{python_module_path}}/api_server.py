@@ -39,6 +39,11 @@ class APIServer:
         GET  /robot/navigation/return    — let the robot navigate back to its base position
         GET  /robot/navigation/route     — let the robot navigate along a route
         GET  /robot/incident-detection/routes  - receive all incident detection routes
+
+        POST /simulation/incident        — spawn an incident
+        POST /simulation/buy             — simulate someone buying items in the store
+        POST /simulation/restock         — simulate a delivery truck restocking the store
+
     """
 
     def __init__(self, port: int = DEFAULT_PORT):
@@ -75,6 +80,10 @@ class APIServer:
         app.router.add_get("/robot/camera/latest", self._handle_robot_camera_latest)
         app.router.add_get("/robot/incident-detection/routes", self._handle_incident_detection_routes)
         app.router.add_get("/health", self._handle_health)
+        app.router.add_post("/simulation/incident", self._handle_spawn_incident)
+        app.router.add_delete("/simulation/incident", self._handle_resolve_incident)
+        app.router.add_post("/simulation/buy", self._handle_buy_products)
+        app.router.add_post("/simulation/restock", self._handle_restock_products)
 
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -189,7 +198,7 @@ class APIServer:
         stock_level, shelf_levels with product stock ratios.
         """
         from aiohttp import web
-                            
+
         route = request.query.get("route", "").strip()
         if not route:
             return web.json_response(
@@ -293,7 +302,7 @@ class APIServer:
 
     # ------------------------------------------------------------------
     # Robot Incident Detection Endpoints
-    # ------------------------------------------------------------------    
+    # ------------------------------------------------------------------
     async def _handle_incident_detection_routes(self, request):
         """
         List available robot incident detection routes.
@@ -394,7 +403,7 @@ class APIServer:
         except Exception as e:
             carb.log_error(f"[APIServer] Robot status error: {e}")
             return web.json_response({"error": str(e)}, status=500)
-    
+
     async def _handle_stop_robot(self, request):
         """Stop robot movement."""
         from aiohttp import web
@@ -407,7 +416,7 @@ class APIServer:
         except Exception as e:
             carb.log_error(f"[APIServer] Robot couldn't be stopped: {e}")
             return web.json_response({"error": str(e)}, status=500)
-        
+
     async def _handle_navigate_robot_to_base(self, request):
         """Let the robot navigate back to base."""
         from aiohttp import web
@@ -467,6 +476,165 @@ class APIServer:
             )
         except Exception as e:
             carb.log_error(f"[APIServer] Robot camera latest frame error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+
+    # -------------------------------------------------------------------------
+    # Simulation Endpoints
+    # -------------------------------------------------------------------------
+
+
+    async def _handle_spawn_incident(self, request):
+        """Spawn an incident in the store"""
+        from aiohttp import web
+        incident_types = ["fire", "trash", "spill", "random"]
+        try:
+            data = await request.json()
+            incident_type = data.get("incident_type", "").strip()
+            if incident_type not in incident_types:
+                return web.json_response(
+                    {
+                        "success": False,
+                        "error": f"Invalid incident type: Valid incident types: {incident_types}",
+                    },
+                    status=422,
+                )
+
+            # Get custom messaging object
+            mgr = None
+            try:
+                from . import custom_messaging as _cm_mod
+                mgr = getattr(_cm_mod, '_manager_instance', None)
+            except Exception:
+                pass
+
+            if mgr is None:
+                return web.json_response(
+                    {"error": "CustomMessageManager not available", "routes": {}, "count": 0},
+                    status=503,
+                )
+
+            result = mgr._usd_spawner._on_incident_spawn_request({ "incident_type": incident_type})
+            return web.json_response(result)
+        except Exception as e:
+            carb.log_error(f"[APIServer] Incident Spawner Error: {e}")
+            return web.json_response({"success": False, "error": str(e)}, status=500)
+
+
+    async def _handle_resolve_incident(self, request):
+        """Delete an incident in the store"""
+        from aiohttp import web
+        try:
+            incident_id = request.query.get("incident_id")
+            if not incident_id:
+                return web.json_response(
+                    {
+                        "success": False,
+                        "error": "Missing incident id.",
+                    },
+                    status=422,
+                )
+
+            # Get custom messaging object
+            mgr = None
+            try:
+                from . import custom_messaging as _cm_mod
+                mgr = getattr(_cm_mod, '_manager_instance', None)
+            except Exception:
+                pass
+
+            if mgr is None:
+                return web.json_response(
+                    {"error": "CustomMessageManager not available", "routes": {}, "count": 0},
+                    status=503,
+                )
+
+            result = mgr._usd_spawner._on_incident_delete_request({ "incident_id": incident_id})
+            return web.json_response(result)
+        except Exception as e:
+            carb.log_error(f"[APIServer] Incident Resolver Error: {e}")
+            return web.json_response({"success": False, "error": str(e)}, status=500)
+
+
+    async def _handle_buy_products(self, request):
+        """Spawn an incident in the store"""
+        from aiohttp import web
+        incident_types = ["fire", "trash", "spill", "random"]
+        try:
+            data = await request.json()
+            incident_type = data.get("incident_type", "").strip()
+            if incident_type not in incident_types:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": f"Invalid incident type: Valid incident types: {incident_types}",
+                    },
+                    status=404,
+                )
+
+            # Get custom messaging object
+            mgr = None
+            try:
+                from . import custom_messaging as _cm_mod
+                mgr = getattr(_cm_mod, '_manager_instance', None)
+            except Exception:
+                pass
+
+            if mgr is None:
+                return web.json_response(
+                    {"error": "CustomMessageManager not available", "routes": {}, "count": 0},
+                    status=503,
+                )
+
+            mgr._usd_spawner._on_incident_spawn_request({ incident_type: incident_type})
+            return web.json_response(
+                {
+                    "ok": True,
+                }
+            )
+        except Exception as e:
+            carb.log_error(f"[APIServer] Incident Spawner Error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+
+    async def _handle_restock_products(self, request):
+        """Spawn an incident in the store"""
+        from aiohttp import web
+        incident_types = ["fire", "trash", "spill", "random"]
+        try:
+            data = await request.json()
+            incident_type = data.get("incident_type", "").strip()
+            if incident_type not in incident_types:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": f"Invalid incident type: Valid incident types: {incident_types}",
+                    },
+                    status=404,
+                )
+
+            # Get custom messaging object
+            mgr = None
+            try:
+                from . import custom_messaging as _cm_mod
+                mgr = getattr(_cm_mod, '_manager_instance', None)
+            except Exception:
+                pass
+
+            if mgr is None:
+                return web.json_response(
+                    {"error": "CustomMessageManager not available", "routes": {}, "count": 0},
+                    status=503,
+                )
+
+            mgr._usd_spawner._on_incident_spawn_request({ incident_type: incident_type})
+            return web.json_response(
+                {
+                    "ok": True,
+                }
+            )
+        except Exception as e:
+            carb.log_error(f"[APIServer] Incident Spawner Error: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
 
