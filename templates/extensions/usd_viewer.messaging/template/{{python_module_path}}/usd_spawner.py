@@ -1232,6 +1232,10 @@ class UsdSpawner:
                 if depth > 4:
                     return
                 for c in parent_prim.GetChildren():
+                    path_str = str(c.GetPath())
+                    # Do not include hidden prototype assets in results
+                    if "/Prototypes/" in path_str:
+                        continue
                     name       = c.GetName()
                     name_lower = name.lower()
                     base_lower = re.sub(r"_\d+$", "", name_lower)
@@ -1256,49 +1260,42 @@ class UsdSpawner:
     # Delete helpers
     # ------------------------------------------------------------------
 
-    def _delete_usd(self, prim_name: str) -> tuple:
+    def _delete_usd(self, asset_key: str) -> tuple:
         """
         Remove the most recently spawned prim for the given asset key.
         Returns (success: bool, prim_path_or_error: str).
-
-        Falls back to a stage scan when _spawned_prims is empty (e.g. after
-        extension reload) so pre-existing prims can still be deleted.
         """
         stage = omni.usd.get_context().get_stage()
-        paths = self._spawned_prims.get(prim_name, [])
 
-        # Filter to paths still present on stage
-        existing = [p for p in paths if stage.GetPrimAtPath(p).IsValid()]
-        self._spawned_prims[prim_name] = existing
+        # 1. Check in-memory spawned prims (Current Session) ---
+        tracked_paths = self._spawned_prims.get(asset_key, [])
+        valid_tracked = [p for p in tracked_paths if stage.GetPrimAtPath(p).IsValid()]
+        self._spawned_prims[asset_key] = valid_tracked  # Clean up dead paths
 
-        # Fallback: scan /World for matching prims when nothing is tracked
-        # (covers extension reloads or prims spawned in a previous session).
-        if not existing:
-            safe = re.sub(r"[^A-Za-z0-9_]", "_", prim_name).strip("_") or "Asset"
-            world_prim = stage.GetPrimAtPath("/World")
-            if world_prim:
-                pattern = re.compile(rf"^/World/{re.escape(safe)}(_\d+)?$")
-                for child in world_prim.GetChildren():
-                    path_str = str(child.GetPath())
-                    if pattern.match(path_str):
-                        existing.append(path_str)
-                existing.sort()   # ascending — pop() gives the highest-numbered one
-                carb.log_info(
-                    f"[UsdSpawner] Stage-scan found {len(existing)} "
-                    f"'{prim_name}' prim(s): {existing}"
-                )
+        if valid_tracked:
+            target_path = valid_tracked[-1]
+            if stage.RemovePrim(target_path):
+                self._spawned_prims[asset_key].remove(target_path)
+                carb.log_info(f"[UsdSpawner] Deleted tracked prim: {target_path}")
+                return True, target_path
+            return False, f"Failed to remove tracked prim at {target_path}"
 
-        if not existing:
-            return False, f"No spawned '{prim_name}' found on stage"
+        # 2. FALLBACK: Include also prims from the stage scan in the candidate set.
+        existing_paths = self._find_prims_by_asset_key(asset_key)
 
-        # Remove the most recently spawned instance
-        prim_path = existing.pop()
-        self._spawned_prims[prim_name] = existing
+        if not existing_paths:
+            carb.log_warn(f"[UsdSpawner] Could not find any prims to delete for '{asset_key}'")
+            return False, f"No prims found for {asset_key}"
 
-        stage.RemovePrim(prim_path)
-        self._inventory_remove(prim_path)
-        carb.log_info(f"[UsdSpawner] Deleted '{prim_path}'")
-        return True, prim_path
+        # Grab the highest-numbered prim on the stage
+        target_path = existing_paths[-1]
+
+        if stage.RemovePrim(target_path):
+            self._inventory_remove(target_path)
+            carb.log_info(f"[UsdSpawner] Successfully deleted fallback prim: {target_path}")
+            return True, target_path
+
+        return False, f"Failed to remove prim at {target_path}"
 
     def _on_delete_request(self, event) -> None:
         payload    = event.payload

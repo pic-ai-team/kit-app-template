@@ -82,7 +82,7 @@ class APIServer:
         app.router.add_get("/health", self._handle_health)
         app.router.add_post("/simulation/incident", self._handle_spawn_incident)
         app.router.add_delete("/simulation/incident", self._handle_resolve_incident)
-        app.router.add_post("/simulation/buy", self._handle_buy_products)
+        app.router.add_post("/simulation/buy", self._handle_buy_product)
         app.router.add_post("/simulation/restock", self._handle_restock_products)
 
         self._runner = web.AppRunner(app)
@@ -556,21 +556,13 @@ class APIServer:
             return web.json_response({"success": False, "error": str(e)}, status=500)
 
 
-    async def _handle_buy_products(self, request):
-        """Spawn an incident in the store"""
+    async def _handle_buy_product(self, request):
+        """Remove a given quantity of a product from the store"""
         from aiohttp import web
-        incident_types = ["fire", "trash", "spill", "random"]
         try:
             data = await request.json()
-            incident_type = data.get("incident_type", "").strip()
-            if incident_type not in incident_types:
-                return web.json_response(
-                    {
-                        "ok": False,
-                        "error": f"Invalid incident type: Valid incident types: {incident_types}",
-                    },
-                    status=404,
-                )
+            asset_key = data.get("asset_key", "").strip()
+            quantity = data.get("quantity", 1)
 
             # Get custom messaging object
             mgr = None
@@ -585,16 +577,22 @@ class APIServer:
                     {"error": "CustomMessageManager not available", "routes": {}, "count": 0},
                     status=503,
                 )
-
-            mgr._usd_spawner._on_incident_spawn_request({ incident_type: incident_type})
-            return web.json_response(
-                {
-                    "ok": True,
-                }
-            )
+            qty_removed = 0
+            for i in range(quantity):
+                success, info = mgr._usd_spawner._delete_usd(asset_key)
+                if success:
+                    qty_removed += 1
+            success = True if qty_removed > 0 else False
+            return web.json_response({"success": success, "qty_removed": qty_removed})
         except Exception as e:
-            carb.log_error(f"[APIServer] Incident Spawner Error: {e}")
-            return web.json_response({"error": str(e)}, status=500)
+            carb.log_error(f"[APIServer] Buy Products Error: {e}")
+            return web.json_response(
+                {"success": False, "error": f"Buying products failed: {e}", "qty_removed": 0},
+                status=500,
+            )
+
+
+
 
 
     async def _handle_restock_products(self, request):
