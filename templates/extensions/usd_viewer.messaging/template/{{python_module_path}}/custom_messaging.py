@@ -1039,18 +1039,18 @@ class CustomMessageManager:
             return
 
         # 4. Merge into unified shelf levels aligned by floor_z
-        shelf_levels = self._merge_shelf_levels(all_rows, tolerance)
+        shelf_rows = self._merge_shelf_rows(all_rows, tolerance)
 
         # 5. Enrich with stock / initial_stock from product_info
         product_shelf_count: dict = {}
-        for lv in shelf_levels:
+        for lv in shelf_rows:
             for key in lv.get("products", {}):
                 product_shelf_count[key] = product_shelf_count.get(key, 0) + 1
 
         total_stock = 0
         total_initial_stock = 0
 
-        for lv in shelf_levels:
+        for lv in shelf_rows:
             shelf_stock = 0
             shelf_init = 0
             for key, prod_data in lv.get("products", {}).items():
@@ -1076,7 +1076,7 @@ class CustomMessageManager:
             "analyzeShelfResponse",
             payload={
                 "success":      True,
-                "shelf_levels": shelf_levels,
+                "shelf_rows": shelf_rows,
                 "asset_keys":   list(all_rows.keys()),
                 "thumbnail":    thumbnail_b64,
                 "tolerance_cm": tolerance,
@@ -1087,7 +1087,7 @@ class CustomMessageManager:
         )
 
     @staticmethod
-    def _merge_shelf_levels(all_rows: dict, tolerance: float) -> list:
+    def _merge_shelf_rows(all_rows: dict, tolerance: float) -> list:
         """
         Align per-product rows into shared shelf levels by floor_z proximity.
         Returns [{level, floor_z, products: {asset_key: {count, prim_paths}}}]
@@ -1114,7 +1114,7 @@ class CustomMessageManager:
                 cur = [entry]
         clusters.append(cur)
 
-        shelf_levels = []
+        shelf_rows = []
         for level_num, cluster in enumerate(clusters, start=1):
             avg_z = round(sum(e[0] for e in cluster) / len(cluster), 2)
             products: dict = {}
@@ -1123,9 +1123,9 @@ class CustomMessageManager:
                     products[key] = {"count": 0, "prim_paths": []}
                 products[key]["count"]      += row["prim_count"]
                 products[key]["prim_paths"] += row["prim_paths"]
-            shelf_levels.append({"level": level_num, "floor_z": avg_z, "products": products})
+            shelf_rows.append({"level": level_num, "floor_z": avg_z, "products": products})
 
-        return shelf_levels
+        return shelf_rows
 
     # ===== AUTOMATIC SHELF ANALYSIS (robot route-based) =====
 
@@ -1155,7 +1155,7 @@ class CustomMessageManager:
         1. Navigate robot to waypoint and wait for arrival
         2. Capture high-res frame from robot camera (2000x2000, Q90)
         3. POST to /api/vision/identify-shelf-products → asset_keys + product_info + rack
-        4. Run row detection per product (reuse _merge_shelf_levels)
+        4. Run row detection per product (reuse _merge_shelf_rows)
         5. Compute stock ratios using initial_stock from product_info
 
         After all waypoints: merge results that share the same rack and
@@ -1338,17 +1338,17 @@ class CustomMessageManager:
                         merged_rows[key] = rows
                 merged_product_info.update(wp_raw["product_info"])
 
-            shelf_levels = self._merge_shelf_levels(merged_rows, tolerance)
+            shelf_rows = self._merge_shelf_rows(merged_rows, tolerance)
 
             product_shelf_count: dict = {}
-            for lv in shelf_levels:
+            for lv in shelf_rows:
                 for key in lv.get("products", {}):
                     product_shelf_count[key] = product_shelf_count.get(key, 0) + 1
 
             total_stock = 0
             total_initial_stock = 0
 
-            for lv in shelf_levels:
+            for lv in shelf_rows:
                 shelf_stock = 0
                 shelf_init = 0
                 for key, prod_data in lv.get("products", {}).items():
@@ -1386,13 +1386,13 @@ class CustomMessageManager:
                 ),
                 "stock": total_stock,
                 "initial_stock": total_initial_stock,
-                "shelf_levels": shelf_levels,
+                "shelf_rows": shelf_rows,
                 "asset_keys": list(merged_rows.keys()),
             }
             results.append(rack_result)
             carb.log_info(
                 f"[AutoShelfAnalysis] Rack {rack_name}: "
-                f"stock={total_stock}/{total_initial_stock} levels={len(shelf_levels)} "
+                f"stock={total_stock}/{total_initial_stock} levels={len(shelf_rows)} "
                 f"(merged from {len(group)} waypoint(s))"
             )
 

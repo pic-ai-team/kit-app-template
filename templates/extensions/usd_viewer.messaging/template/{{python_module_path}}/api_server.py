@@ -83,7 +83,7 @@ class APIServer:
         app.router.add_post("/simulation/incident", self._handle_spawn_incident)
         app.router.add_delete("/simulation/incident", self._handle_resolve_incident)
         app.router.add_post("/simulation/buy", self._handle_buy_product)
-        app.router.add_post("/simulation/restock", self._handle_restock_products)
+        app.router.add_post("/simulation/restock", self._handle_restock_product)
 
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -195,7 +195,7 @@ class APIServer:
             model (optional): Vision model — "qwen" (default) or "cosmos".
 
         Returns JSON with per-rack analysis including rack_id, rack_name,
-        stock_level, shelf_levels with product stock ratios.
+        stock_level, shelf_rows with product stock ratios.
         """
         from aiohttp import web
 
@@ -592,24 +592,13 @@ class APIServer:
             )
 
 
-
-
-
-    async def _handle_restock_products(self, request):
-        """Spawn an incident in the store"""
+    async def _handle_restock_product(self, request):
+        """Spawm a given quantity of a product in the store"""
         from aiohttp import web
-        incident_types = ["fire", "trash", "spill", "random"]
         try:
             data = await request.json()
-            incident_type = data.get("incident_type", "").strip()
-            if incident_type not in incident_types:
-                return web.json_response(
-                    {
-                        "ok": False,
-                        "error": f"Invalid incident type: Valid incident types: {incident_types}",
-                    },
-                    status=404,
-                )
+            asset_key = data.get("asset_key", "").strip()
+            quantity = data.get("quantity", 1)
 
             # Get custom messaging object
             mgr = None
@@ -625,15 +614,14 @@ class APIServer:
                     status=503,
                 )
 
-            mgr._usd_spawner._on_incident_spawn_request({ incident_type: incident_type})
-            return web.json_response(
-                {
-                    "ok": True,
-                }
-            )
+            success, qty_restocked = mgr._usd_spawner._restock_product(asset_key, quantity)
+            return web.json_response({"success": success, "qty_restocked": qty_restocked})
         except Exception as e:
-            carb.log_error(f"[APIServer] Incident Spawner Error: {e}")
-            return web.json_response({"error": str(e)}, status=500)
+            carb.log_error(f"[APIServer] Restock Products Error: {e}")
+            return web.json_response(
+                {"success": False, "error": f"Restocking products failed: {e}", "qty_restocked": 0},
+                status=500,
+            )
 
 
 # Module-level singleton

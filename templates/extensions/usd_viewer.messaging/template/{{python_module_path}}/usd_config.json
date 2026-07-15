@@ -11,5 +11,5 @@
   "shelf_rows_file":  "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/shelf_rows.json",
 
 
-  "incident_spawn_zones": [[-80, -20, -200, 1000], [-620, -510, -180, 1400]] 
+  "incident_spawn_zones": [[-80, -20, -200, 1000], [-620, -510, -180, 1400]]
 }

@@ -48,7 +48,7 @@ _USD_BASE         = _cfg.get("usd_base",         "/home/aicenter/adrian/local-om
 _USD_ASSETS       = _cfg.get("usd_assets",       "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/usd")
 _INVENTORY_FILE   = _cfg.get("inventory_file",   "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/asset_list_shop_already.json")
 _STAGE_PRIMS_FILE = _cfg.get("stage_prims_file", "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/stage_prims.json")
-_SHELF_ROWS_FILE  = _cfg.get("shelf_rows_file",  "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/shelf_rows.json")
+_shelf_rowS_FILE  = _cfg.get("shelf_rows_file",  "/home/aicenter/adrian/local-omniverse/omniverse-vs-agent-backend/assets/shelf_rows.json")
 
 # ---------------------------------------------------------------------------
 # Incident spawn zones — rectangles on the ground plane (floor level) where
@@ -195,6 +195,11 @@ for _k in ASSET_LIBRARY:
         _BRAND_GROUPS.setdefault(_prefix, []).append(_k)
 _BRAND_GROUPS = {k: v for k, v in _BRAND_GROUPS.items() if len(v) > 1}
 
+
+
+# ---------------------------------------------------------------------------
+# Persistent rotation corrections (saved/loaded from JSON)
+# ---------------------------------------------------------------------------
 # Per-asset spawn rotation corrections.
 # Some USDZ assets are authored with a non-standard "up" axis and appear
 # "fallen" when spawned.  These corrections are composed on top of any
@@ -220,16 +225,7 @@ _BRAND_GROUPS = {k: v for k, v in _BRAND_GROUPS.items() if len(v) > 1}
 # Correction 1 — stand up:  -90° around Z maps X-axis (long axis) → -Y (vertical).
 # Correction 2 — face fix:   rotate around Y to point the front face toward the aisle.
 #   Try 0, 90, -90, or 180 degrees.  Change only this value while iterating.
-ASSET_SPAWN_ROTATION_CORRECTION: dict[str, list] = {
-    "lipton_milktea": [
-        ((0, 0, 1), -90),   # Stand up (X→up)
-        ((0, 1, 0),  90),   # Face the shelf front — try 0 / 90 / -90 / 180 if wrong
-    ],
-}
 
-# ---------------------------------------------------------------------------
-# Persistent rotation corrections (saved/loaded from JSON)
-# ---------------------------------------------------------------------------
 # JSON file lives alongside this module so edits survive extension reloads.
 # Format: { "prim_name": { "euler_x": 0, "euler_y": 90, "euler_z": -90 } }
 # When a key exists here it takes priority over ASSET_SPAWN_ROTATION_CORRECTION.
@@ -602,7 +598,7 @@ class UsdSpawner:
                 # Known product — record with position and shelf group
                 position = [0.0, 0.0, 0.0]
                 rack_id = None
-                shelf_level = None
+                shelf_row = None
 
                 # Prefer explicit prim attributes; keep None when missing.
                 try:
@@ -613,12 +609,12 @@ class UsdSpawner:
                             _rack_str = str(_rack_val).strip()
                             rack_id = _rack_str or None
 
-                    shelf_attr = prim.GetAttribute("shelf_level")
+                    shelf_attr = prim.GetAttribute("shelf_row")
                     if shelf_attr and shelf_attr.HasAuthoredValueOpinion():
                         _shelf_val = shelf_attr.Get(Usd.TimeCode.Default())
                         if _shelf_val is not None:
                             _shelf_str = str(_shelf_val).strip()
-                            shelf_level = _shelf_str or None
+                            shelf_row = _shelf_str or None
                 except Exception as exc:
                     carb.log_warn(f"[UsdSpawner] Stage scan: attribute read failed for {prim_path}: {exc}")
 
@@ -663,7 +659,7 @@ class UsdSpawner:
                     "position":    position,
                     "prim_name":   prim_name,
                     "rack_id":     rack_id,
-                    "shelf_level": shelf_level,
+                    "shelf_row": shelf_row,
                     "unit_count":  unit_count,
                     "source":      "stage_scan",
                 }
@@ -809,6 +805,8 @@ class UsdSpawner:
         self, usd_path: str, prim_name: str, position: "Gf.Vec3d",
         rotation: "Gf.Rotation" = None,
         snap_y_to: float = None,
+        rack_id: str = None,
+        shelf_row: int = None
     ) -> str:
         """
         Reference `usd_path` into the current stage at `position`.
@@ -870,26 +868,6 @@ class UsdSpawner:
                 f"[UsdSpawner] Spawn: using saved rotation correction"
                 f" X={ex}° Y={ey}° Z={ez}° for '{prim_name}'"
             )
-        else:
-            correction_entries = ASSET_SPAWN_ROTATION_CORRECTION.get(prim_name) or []
-            # Normalise: a single tuple → list of one
-            if correction_entries and isinstance(correction_entries[0], (int, float)):
-                correction_entries = [correction_entries]
-            for correction_entry in correction_entries:
-                try:
-                    axis, angle_deg = correction_entry
-                    correction_rot = Gf.Rotation(Gf.Vec3d(*axis), angle_deg)
-                    if effective_rotation is not None:
-                        # Apply correction first (in asset-local space), then world rotation.
-                        effective_rotation = effective_rotation * correction_rot
-                    else:
-                        effective_rotation = correction_rot
-                    carb.log_warn(
-                        f"[UsdSpawner] Spawn: applying correction rot {angle_deg}° "
-                        f"around {axis} for '{prim_name}'"
-                    )
-                except Exception as corr_err:
-                    carb.log_warn(f"[UsdSpawner] Spawn: correction rotation failed: {corr_err}")
 
         # Apply effective rotation (inherited + correction) if any.
         if effective_rotation is not None:
@@ -1006,7 +984,7 @@ class UsdSpawner:
 
         # Record for later deletion (in-memory + persistent inventory)
         self._spawned_prims.setdefault(prim_name, []).append(prim_path)
-        self._inventory_add(prim_path, prim_name, usd_path, position)
+        self._inventory_add(prim_path, prim_name, usd_path, position, rack_id=rack_id, shelf_row=shelf_row)
 
         # ── Debug: report what actually landed on stage ──────────────────
         try:
@@ -1069,31 +1047,483 @@ class UsdSpawner:
     def _reply_replace(self, payload: dict) -> None:
         get_eventdispatcher().dispatch_event("replaceUsdResponse", payload=payload)
 
+
+    # ------------------------------------------------------------------
+    # Simulation Product Restocking
+    # ------------------------------------------------------------------
+    def _restock_product(self, asset_key: str, quantity_ordered: int) -> bool:
+        """
+        Restocks a specific product across available store shelves using planogram data.
+        Calculates theoretical spatial slots using direction vectors to support arbitrary rack rotations,
+        faces existing valid stock forward, and spawns new stock in remaining slots.
+
+        Args:
+            asset_key (str): Unique identifier for the product asset.
+            quantity_ordered (int): Total quantity of the product to restock across all shelves.
+
+        Returns:
+            bool: True if restocking process executed successfully, False otherwise.
+        """
+        # 1. Retrieve rack and planogram data
+        success, result = self._send_to_backend(f"/api/store-layout/{asset_key}", "GET")
+        if not success or not result.get("rack_ids"):
+            return False
+
+        rack_id = result["rack_ids"][0]
+
+        success, result = self._send_to_backend(f"/api/store-layout/racks/{rack_id}/planogram", "GET")
+        if not success:
+            return False
+
+        shelf_width = result.get("shelf_width")
+        shelf_depth = result.get("shelf_depth")
+        available_shelf_height = result.get("available_shelf_height")
+        shelves = result.get("shelves")
+        anchor = result.get("anchor") # Expected format: "(X, Y, Z)"
+        if not shelf_width or not shelf_depth or not shelves or not anchor or len(anchor) != 3 or not available_shelf_height:
+            carb.log_error(f"[UsdSpawner] Planogram missing required params for rack {rack_id}")
+            return False, 0
+
+
+        # Cast the rack anchor to float
+        anchor = [float(anchor[0]), float(anchor[1]), float(anchor[2])]
+
+        carb.log_warn("[UsdSpawner] ====================================================================================")
+        carb.log_warn(f"[UsdSpawner] Start Restocking on Rack {rack_id}")
+        carb.log_warn("[UsdSpawner] ====================================================================================")
+        carb.log_warn("[UsdSpawner] Restock Step 1 Complete")
+        # 2. Extract normalized direction vectors for procedural spatial calculations
+        width_dir = result.get("shelf_width_direction", [1.0, 0.0, 0.0])
+        width_dir = [float(width_dir[0]), float(width_dir[1]), float(width_dir[2])]
+        depth_dir = result.get("shelf_depth_direction", [0.0, 1.0, 0.0])
+        depth_dir = [float(depth_dir[0]), float(depth_dir[1]), float(depth_dir[2])]
+        remaining_to_spawn = quantity_ordered
+        total_spawned = 0
+        carb.log_warn(f"[UsdSpawner] Width dir: {width_dir}  Depth dir: {depth_dir}")
+        relocated_or_spawned_prims = []
+        # 3. Process each shelf containing the target product
+        for shelf in shelves:
+            if remaining_to_spawn <= 0:
+                break  # Order fulfilled, halt processing further shelves
+
+            sequence = shelf.get("layout_sequence")
+            shelf_height = shelf.get("elevation")
+            if not sequence or not shelf_height:
+                carb.log_error(f"[UsdSpawner] Planogram missing required params for rack {rack_id} and shelf {shelf}")
+                return False, 0
+
+            # Subtract
+            shelf_height_offset = shelf_height - anchor[2]
+            # Bypassing shelves that do not contain the target asset in the layout
+            if not any(item.get("asset_key") == asset_key for item in sequence):
+                continue
+
+            shelf_row = shelf.get("shelf_row")
+            carb.log_warn("[UsdSpawner] ----------------------------------------------------------------------")
+            carb.log_warn(f"[UsdSpawner] Checking Shelf Row {shelf_row}")
+            # 4. Calculate Dynamic Margins (Even spacing of separate products across the shelf)
+            item_margin = 2.0  # Keep intra-product gap small and fixed (e.g., gap between two Pringles cans)
+
+            # PASS 1: Calculate total physical width of ALL products on this shelf
+            total_raw_width = 0.0
+            for item in sequence:
+                i_key = item.get("asset_key")
+                f_count = item.get("facing_count", 1)
+                i_w = self._get_usd_item_width(i_key) # Need width of this specific item
+
+                # Raw width = (Width * Facings) + the tiny gaps between the facings
+                total_raw_width += (i_w * f_count) + (item_margin * (f_count - 1))
+            carb.log_warn(f"[UsdSpawner] Step 4: Restock Step 4 Pass 1 Complete. Total raw width: {total_raw_width}")
+            # Distribute remaining shelf space evenly between distinct product groups
+            # We divide by (len(sequence) - 1) to have no padding on the left and right side
+            available_empty_space = max(0.0, shelf_width - total_raw_width)
+            dynamic_margin = available_empty_space / (len(sequence) - 1) if sequence else 0.0
+            carb.log_warn(f"[UsdSpawner] Step 4: Available space: {available_empty_space}, Dynamic Margin: {dynamic_margin}")
+
+            if available_empty_space <= 0.0:
+                carb.log_error(f"[UsdSpawner] Products require more space than available => Restocking not possible in shelf row {shelf_row}")
+                continue
+
+            # PASS 2: Find the specific target zone utilizing the new dynamic margin
+            current_width_offset = 0.0 # Start at the very left
+            target_zone_start_offset = 0.0
+            target_facing_count = 0
+            target_zone_width = 0.0
+
+            item_w, item_d, item_h = self._get_usd_item_dimensions(asset_key)
+
+            carb.log_warn("[UsdSpawner] Step 4: Checking Planogram item dimensions")
+            for item in sequence:
+                item_key = item.get("asset_key")
+                facing_count = item.get("facing_count", 1)
+
+                # Width of this specific product group
+                group_width = (self._get_usd_item_width(item_key) * facing_count) + (item_margin * (facing_count - 1))
+                carb.log_warn(f"[UsdSpawner] Step 4: item: {item_key}, group_width: {group_width}")
+                if item_key == asset_key:
+                    target_zone_start_offset = current_width_offset
+                    target_facing_count = facing_count
+                    target_zone_width = group_width
+                    break
+
+                # Advance the offset: Add the group width PLUS the dynamic margin between distinct products
+                current_width_offset += group_width + dynamic_margin
+            carb.log_warn("[UsdSpawner] Restock Step 4 all Complete")
+            # 5. Clear Foreign Objects (Oriented Spatial Sweep)
+            # Calculate the geometric center of the target zone for the overlap query
+            center_x = anchor[0] + (width_dir[0] * (target_zone_start_offset + (target_zone_width / 2.0))) + (depth_dir[0] * (shelf_depth / 2.0))
+            center_y = anchor[1] + (width_dir[1] * (target_zone_start_offset + (target_zone_width / 2.0))) + (depth_dir[1] * (shelf_depth / 2.0))
+            center_z = min(anchor[2] + shelf_height_offset + (item_h / 2.0), anchor[2] + shelf_height_offset + (available_shelf_height / 2))
+
+            zone_center = [center_x, center_y, center_z]
+            half_extents = [target_zone_width / 2.0, shelf_depth / 2.0, item_h / 2.0]
+            carb.log_warn("[UsdSpawner] Step 5: Item Bounding Box:")
+            carb.log_warn(f"zone_center: {zone_center}")
+            carb.log_warn(f"half_extents: {half_extents}")
+            # Query PhysX for prims within the oriented bounding box
+            prims_in_zone = self._get_prims_in_obb(center=zone_center, half_extents=half_extents, w_dir=width_dir, d_dir=depth_dir)
+            carb.log_warn(f"[UsdSpawner] Step 5: Prims in zone for {asset_key}: {str(prims_in_zone)}")
+            valid_existing_prims = []
+            for prim in prims_in_zone:
+                # Bypass structural fixtures (shelves, racks) to prevent deleting store geometry
+                if self._is_structural_mesh(prim):
+                    continue
+
+                # Bypass in this iteration spawned or relocated prims
+                if prim in relocated_or_spawned_prims:
+                    continue
+
+
+                if self._get_prim_asset_key(prim) == asset_key:
+                    valid_existing_prims.append(prim)
+                else:
+                    # Isolate physics-disrupting foreign objects
+                    carb.log_warn(f"[UsdSpawner] Step 5: Delete foreign prim: {prim}")
+                    prim_path = str(prim.GetPath())
+                    self._on_delete_request({"prim_path": prim_path})
+
+            carb.log_warn("[UsdSpawner] Restock Step 5 Complete")
+            # 6. Generate the Theoretical Grid Pool
+            max_depth_capacity = int(shelf_depth // (item_d + item_margin))
+            carb.log_warn(f"[UsdSpawner] Step 6: Max Depth Capacity: {max_depth_capacity}")
+            grid_slots = []
+
+            for row in range(max_depth_capacity):
+                for col in range(target_facing_count):
+                    # Compute localized scalar offsets relative to the anchor
+                    w_scalar = target_zone_start_offset + (col * (item_w + item_margin)) + (item_w / 2.0)
+                    d_scalar = (row * (item_d + item_margin)) + (item_d / 2.0)
+
+                    # Transform scalars into world-space coordinates using direction vectors
+                    slot_x = anchor[0] + (width_dir[0] * w_scalar) + (depth_dir[0] * d_scalar)
+                    slot_y = anchor[1] + (width_dir[1] * w_scalar) + (depth_dir[1] * d_scalar)
+                    slot_z = anchor[2] + shelf_height_offset
+
+                    grid_slots.append({
+                        "pos": (slot_x, slot_y, slot_z),
+                        "row_index": row
+                    })
+
+            # Sort grid slots (lowest row_index represents the back of the shelf)
+            grid_slots.sort(key=lambda slot: slot["row_index"], reverse=True)
+            carb.log_warn(f"[UsdSpawner] Step 6: Grid slots: {grid_slots}")
+            carb.log_warn("[UsdSpawner] Restock Step 6 Complete")
+
+            # 7. Facing: Align valid existing stock to the frontmost available slots
+            for prim in valid_existing_prims:
+                if grid_slots:
+                    front_slot = grid_slots.pop(0)
+                    carb.log_warn(f"[UsdSpawner] Step 7: move {prim} to {front_slot['pos']}")
+                    self._translate_prim(prim, front_slot["pos"])
+                    self._rotate_prim_to_face_shelf_front(prim, depth_dir)
+                    relocated_or_spawned_prims.append(prim)
+                else:
+                    # Zone over-capacity; discard excess manual stock to maintain grid integrity
+                    prim_path = str(prim.GetPath())
+                    carb.log_error(f"[UsdSpawner] Step 7: delete excessive {prim} ")
+                    self._on_delete_request({"prim_path": prim_path})
+            carb.log_warn("[UsdSpawner] Restock Step 7 Complete")
+
+            # 8. Restocking: Populate remaining grid slots up to the ordered quantity
+            quantity_to_spawn_on_shelf = min(remaining_to_spawn, len(grid_slots))
+
+            for _ in range(quantity_to_spawn_on_shelf):
+                empty_slot = grid_slots.pop(0)
+                pos = empty_slot["pos"]
+                spawn_pos = Gf.Vec3d(pos[0], pos[1], pos[2])
+
+                # Retrieve the USD path from your library
+                usd_path = ASSET_LIBRARY.get(asset_key)
+
+                # Use your existing spawn function directly
+                carb.log_warn(f"[UsdSpawner] Step 8: spawn {asset_key} to {spawn_pos}")
+                new_prim_path = self._spawn_usd(usd_path, asset_key, spawn_pos, rack_id=rack_id, shelf_row=shelf_row)
+                stage = omni.usd.get_context().get_stage()
+                new_prim = stage.GetPrimAtPath(new_prim_path)
+                self._rotate_prim_to_face_shelf_front(new_prim, depth_dir)
+                relocated_or_spawned_prims.append(new_prim)
+
+            # Update loop invariants
+            remaining_to_spawn -= quantity_to_spawn_on_shelf
+            total_spawned += quantity_to_spawn_on_shelf
+        carb.log_warn("[UsdSpawner] ----------------------------------------------------------------------")
+        carb.log_warn("[UsdSpawner] Restock Step 8 Complete")
+
+
+        # 9. Final execution report
+        return True, total_spawned
+
+
+    # ------------------------------------------------------------------
+    # Simulation Restocking Helpers
+    # ------------------------------------------------------------------
+
+    def _get_usd_item_dimensions(self, asset_key: str) -> tuple[float, float, float]: # width, depth, height
+        """
+        Calculates the physical (Width, Depth, Height) dimensions of an asset
+        by reading its source USDZ file directly into memory.
+
+        This prevents bounding box corruption from world-space rotations on the live stage
+        and perfectly handles the 'sold out' scenario where no items exist to measure.
+
+        Assumes all assets are natively authored facing the positive X-axis (+X).
+        Therefore:
+          - Native Y-axis extent = Physical Left/Right Width
+          - Native X-axis extent = Physical Front/Back Depth
+          - Native Z-axis extent = Physical Height
+        """
+        usd_path = ASSET_LIBRARY.get(asset_key)
+
+        if usd_path:
+            try:
+                # Open the asset in memory (USD caches this automatically, making it highly efficient)
+                asset_stage = Usd.Stage.Open(usd_path)
+                if asset_stage:
+                    # Target the default prim, or the root if the default prim isn't specified
+                    measure_prim = asset_stage.GetDefaultPrim() or asset_stage.GetPseudoRoot()
+
+                    bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
+                    bbox = bbox_cache.ComputeWorldBound(measure_prim)
+                    rng = bbox.GetRange()
+
+                    if not rng.IsEmpty():
+                        raw_size = rng.GetSize()
+
+                        # 1. Apply base unit scale conversion (e.g., meters to cm) used during spawning
+                        unit_scale = _ASSET_UNIT_SCALE.get(asset_key, 1.0)
+
+                        # 2. Apply any custom user scale corrections saved in the UI
+                        sc = self._scale_corrections.get(asset_key, {})
+                        sx = float(sc.get("scale_x", 1.0))
+                        sy = float(sc.get("scale_y", 1.0))
+                        sz = float(sc.get("scale_z", 1.0))
+
+                        # Calculate final scaled extents
+                        scaled_x = abs(raw_size[0]) * unit_scale * sx
+                        scaled_y = abs(raw_size[1]) * unit_scale * sy
+                        scaled_z = abs(raw_size[2]) * unit_scale * sz
+                        carb.log_warn(f"[UsdSpawner] USD Path: {usd_path}, raw_size: {raw_size}")
+                        carb.log_warn(f"[UsdSpawner] Dimensions for {asset_key}: width: {scaled_y}, depth: {scaled_x}, height: {scaled_z}")
+                        # Map native axes to contextual dimensions: (Width(Y), Depth(X), Height(Z))
+                        return (scaled_y, scaled_x, scaled_z)
+
+            except Exception as e:
+                carb.log_warn(f"[UsdSpawner] Failed to measure source file for {asset_key}: {e}")
+
+        # Fallback dimensions in cm if asset is completely unresolvable
+        carb.log_warn(f"[UsdSpawner] Using default fallback dimensions for {asset_key}")
+        return (10.0, 10.0, 20.0)
+
+    def _get_usd_item_width(self, asset_key: str) -> float:
+        """Convenience wrapper to extract only the physical left-to-right width of an asset."""
+        return self._get_usd_item_dimensions(asset_key)[0]
+
+    def _get_prims_in_obb(self, center: list[float], half_extents: list[float], w_dir: list[float], d_dir: list[float]) -> list[Usd.Prim]:
+        """
+        Performs a spatial overlap query using an Oriented Bounding Box (OBB).
+        Uses mathematical vector projection against world-space coordinates,
+        guaranteeing detection even for decorative assets lacking collision meshes.
+        """
+        stage = omni.usd.get_context().get_stage()
+        world = stage.GetPrimAtPath("/World")
+        if not world:
+            return []
+
+        u = Gf.Vec3d(*w_dir).GetNormalized()
+        v = Gf.Vec3d(*d_dir).GetNormalized()
+        w = Gf.Cross(u, v).GetNormalized()
+
+        c = Gf.Vec3d(*center)
+        eu, ev, ew = half_extents
+
+        found_prims = []
+
+        # Initialize a BBoxCache to calculate the geometric bounds of the prims
+        bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
+
+        def _scan(prim, depth):
+            if depth > 4:
+                return
+
+            try:
+                # 1. Compute the world-space bounding box of the prim's geometry
+                world_bound = bbox_cache.ComputeWorldBound(prim)
+                aligned_range = world_bound.ComputeAlignedRange()
+
+                if not aligned_range.IsEmpty():
+                    min_pt = aligned_range.GetMin()
+                    max_pt = aligned_range.GetMax()
+
+                    # 2. Extract the 8 corners of the bounding box
+                    corners = [
+                        Gf.Vec3d(x, y, z)
+                        for x in (min_pt[0], max_pt[0])
+                        for y in (min_pt[1], max_pt[1])
+                        for z in (min_pt[2], max_pt[2])
+                    ]
+
+                    # Add the center point in case the OBB is entirely inside a massive prim
+                    corners.append((min_pt + max_pt) / 2.0)
+
+                    # 3. Check if ANY corner (or the center) falls inside the OBB
+                    for pt in corners:
+                        d = pt - c
+                        if (abs(Gf.Dot(d, u)) <= eu) and (abs(Gf.Dot(d, v)) <= ev) and (abs(Gf.Dot(d, w)) <= ew):
+                            found_prims.append(prim)
+                            return # Stop recursing; root object overlaps
+            except Exception:
+                pass
+
+            for child in prim.GetChildren():
+                _scan(child, depth + 1)
+
+        for child in world.GetChildren():
+            _scan(child, 1)
+
+        return found_prims
+
+    def _is_structural_mesh(self, prim: Usd.Prim) -> bool:
+        """
+        Safety filter to prevent the restocking logic from accidentally
+        deleting store fixtures. Ignores all assets inside the environment folder.
+        """
+        path = str(prim.GetPath())
+
+        # Explicitly ignore the architecture/store folder
+        if path.startswith("/World/_dstore"):
+            return True
+
+        # Explicitly ignore all prototype prims
+        if path.startswith("/World/Prototypes"):
+            return True
+
+        # Fallback keyword safety checks for loose prims
+        name = prim.GetName().lower()
+        key = self._get_prim_asset_key(prim)
+        structural_keywords = ["shelf", "rack", "floor", "wall", "ceiling", "prototype"]
+
+        if any(keyword in name for keyword in structural_keywords):
+            return True
+        if key and any(keyword in key for keyword in structural_keywords):
+            return True
+
+        return False
+
+    def _get_prim_asset_key(self, prim: Usd.Prim) -> str:
+        """Wrapper around the global resolve function to extract an asset key."""
+        return _resolve_prim_key(prim.GetName()) or ""
+
+    def _remove_foreign_prim(self, prim: Usd.Prim) -> None:
+        """
+        Permanently removes a specific foreign object from the physical stage.
+        We cannot use _delete_usd here, as that deletes the "last spawned"
+        item, whereas we need to delete THIS specific physical intrusion.
+        """
+        stage = omni.usd.get_context().get_stage()
+        path = str(prim.GetPath())
+
+        if stage.RemovePrim(path):
+            self._inventory_remove([path])
+            carb.log_info(f"[UsdSpawner] Cleared foreign object during restock: {path}")
+
+    def _translate_prim(self, prim: Usd.Prim, pos: tuple[float, float, float]) -> None:
+        """
+        Updates the world translation (position) of a USD prim
+        and safely syncs the new coordinates to the persistent JSON inventory.
+        """
+        xform = UsdGeom.Xformable(prim)
+        translate_op = next((op for op in xform.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeTranslate), None)
+
+        if translate_op is None:
+            translate_op = xform.AddTranslateOp()
+
+        translate_op.Set(Gf.Vec3d(*pos))
+
+        # Synchronize location state with the inventory tracking file
+        prim_path = str(prim.GetPath())
+        inv = self._load_inventory()
+
+        if prim_path in inv:
+            inv[prim_path]["position"] = [round(pos[0], 3), round(pos[1], 3), round(pos[2], 3)]
+            self._save_inventory(inv)
+
+
+    def _rotate_prim_to_face_shelf_front(self, prim: Usd.Prim, d_dir: list[float]) -> None:
+        """
+        Forces a prim to face perfectly outward from the shelf.
+        Assumes the asset is natively modeled facing the +X axis. Calculates
+        the absolute Z-yaw required to align +X with the shelf's front normal.
+
+        Args:
+            prim: The USD prim to rotate.
+            d_dir: The depth vector of the shelf (pointing from back to front).
+        """
+        xform = UsdGeom.Xformable(prim)
+
+        # Find the existing RotateXYZ operation, or add one if it doesn't exist
+        rotate_op = next((op for op in xform.GetOrderedXformOps()
+                        if op.GetOpType() == UsdGeom.XformOp.TypeRotateXYZ), None)
+
+        if rotate_op is None:
+            rotate_op = xform.AddRotateXYZOp()
+
+        # The shelf "front" normal is the depth direction
+        target_front_x = d_dir[0]
+        target_front_y = d_dir[1]
+
+        # Calculate yaw angle from +X [1, 0, 0] to the target vector using atan2
+        import math
+        yaw_rad = math.atan2(target_front_y, target_front_x)
+        yaw_deg = math.degrees(yaw_rad)
+
+        # Apply absolute mathematical orientation purely around the Z (Up) axis
+        rotate_op.Set(Gf.Vec3f(0.0, 0.0, yaw_deg))
+
     # ------------------------------------------------------------------
     # Backend HTTP helper
     # ------------------------------------------------------------------
 
     _BACKEND_URL = _cfg.get("backend_url", "http://localhost:8000").rstrip("/")
 
-    def _send_to_backend(self, path: str, method: str, payload: dict) -> bool:
-        """Send JSON to the agent backend (URL from usd_config.json) using the specified HTTP method."""
+    def _send_to_backend(self, path: str, method: str, payload: dict = {}) -> tuple[bool, any]:
         import urllib.request as _ur
         url = f"{self._BACKEND_URL}{path}"
-        data = json.dumps(payload).encode("utf-8")
         method = method.upper().strip()
+        data = json.dumps(payload).encode("utf-8") if method not in ("GET", "HEAD") else None
+        headers = {"Content-Type": "application/json"} if data is not None else {}
         try:
-            req = _ur.Request(
-                url,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method=method,
-            )
+            req = _ur.Request(url, data=data, headers=headers, method=method)
             with _ur.urlopen(req, timeout=5) as resp:
-                carb.log_info(f"[UsdSpawner] {method} {path} → {self._BACKEND_URL}: {resp.read().decode()}")
-                return True
+                body = resp.read().decode()
+                carb.log_info(f"[UsdSpawner] {method} {path} → {self._BACKEND_URL}: {body}")
+                try:
+                    return True, json.loads(body)
+                except json.JSONDecodeError:
+                    return True, body
         except Exception as exc:
             carb.log_warn(f"[UsdSpawner] {method} {path} to {self._BACKEND_URL} failed: {exc}")
-        return False
+        return False, None
+
 
     # ------------------------------------------------------------------
     # Inventory helpers — persistent JSON tracking of spawned prims
@@ -1119,7 +1549,7 @@ class UsdSpawner:
             carb.log_warn(f"[UsdSpawner] Could not save inventory: {exc}")
 
     def _inventory_add(self, prim_path: str, asset_key: str, usd_path: str,
-                       position: "Gf.Vec3d") -> None:
+                       position: "Gf.Vec3d", rack_id: str = None, shelf_row: int = None) -> None:
         """Record a newly spawned prim in the inventory file and notify backend DB."""
         inv = self._load_inventory()
         inv[prim_path] = {
@@ -1140,6 +1570,8 @@ class UsdSpawner:
             "pos_x": round(position[0], 3),
             "pos_y": round(position[1], 3),
             "pos_z": round(position[2], 3),
+            "rack_id": rack_id,
+            "shelf_row": shelf_row,
             "unit_count": 1,
         })
 
@@ -1298,7 +1730,7 @@ class UsdSpawner:
         return False, f"Failed to remove prim at {target_path}"
 
     def _on_delete_request(self, event) -> None:
-        payload    = event.payload
+        payload = getattr(event, "payload", event)
         prim_name  = str(payload.get("prim_name", ""))
         prim_path  = str(payload.get("prim_path", ""))   # single direct path
         prim_paths = payload.get("prim_paths", [])        # batch: list of direct paths
@@ -1895,7 +2327,7 @@ class UsdSpawner:
         ref_rows: list[tuple[float, int]] = []
         if filter_key:
             try:
-                with open(_SHELF_ROWS_FILE) as _rf:
+                with open(_shelf_rowS_FILE) as _rf:
                     _prev = json.load(_rf)
                 if _prev.get("asset_key") == filter_key:
                     ref_rows = [(_r["floor_z"], _r["row"]) for _r in _prev.get("rows", [])]
@@ -1959,8 +2391,8 @@ class UsdSpawner:
             return
 
         try:
-            os.makedirs(os.path.dirname(_SHELF_ROWS_FILE), exist_ok=True)
-            with open(_SHELF_ROWS_FILE, "w") as f:
+            os.makedirs(os.path.dirname(_shelf_rowS_FILE), exist_ok=True)
+            with open(_shelf_rowS_FILE, "w") as f:
                 json.dump(result, f, indent=2)
         except Exception as exc:
             carb.log_warn(f"[UsdSpawner] Could not save shelf_rows.json: {exc}")
@@ -2011,7 +2443,7 @@ class UsdSpawner:
 
         # Load the latest shelf_rows.json written by detectShelfRowsRequest
         try:
-            with open(_SHELF_ROWS_FILE) as f:
+            with open(_shelf_rowS_FILE) as f:
                 shelf_data = json.load(f)
         except Exception as exc:
             _reply(False, f"Could not read shelf_rows.json: {exc}. Run Detect Rows first.")
