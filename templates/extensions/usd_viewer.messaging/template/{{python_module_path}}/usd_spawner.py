@@ -548,10 +548,18 @@ class UsdSpawner:
             return
         if not list(world.GetChildren()):
             return
-        # Stage is loaded and has content — scan it now
-        self._scan_stage_to_inventory()
+        # Stage is loaded and has content - Spawn store inventory
+        self._populate_initial_store_inventory()
         self._scan_pending = False
         self._update_sub = None  # release subscription
+
+    def _populate_initial_store_inventory(self) -> None:
+        """
+        Request the agent backend to populate the store with assets according to the planogram
+        """
+        # 1. Retrieve planogram information with initial product stock
+        self._send_to_backend("/api/store-layout/populate_racks", "GET")
+
 
     def _scan_stage_to_inventory(self) -> None:
         """
@@ -903,9 +911,16 @@ class UsdSpawner:
         # USD-Assets (metersPerUnit=0.01) are already in centimeters → scale 1.0.
         ref_path = prim_path + "/Ref"
         ref_xform = UsdGeom.Xform.Define(stage, ref_path)
+        ref_prim = ref_xform.GetPrim()
+
         _unit_scale = _ASSET_UNIT_SCALE.get(prim_name, 100.0)
         ref_xform.AddScaleOp().Set(Gf.Vec3f(_unit_scale, _unit_scale, _unit_scale))
-        ref_xform.GetPrim().GetReferences().AddReference(usd_path)
+        ref_prim.GetReferences().AddReference(usd_path)
+
+        # Tell USD to implicitly instance this.
+        # If this is the first Pringles can, USD creates the hidden prototype.
+        # If this is the 100th can, USD automatically links it to the existing hidden prototype.
+        ref_prim.SetInstanceable(True)
 
         # Floor-snap: raise prim so its bounding box bottom touches the floor plane.
         # Works for both Y-up (up_idx=1) and Z-up (up_idx=2) stages.
@@ -990,17 +1005,34 @@ class UsdSpawner:
         try:
             outer = stage.GetPrimAtPath(prim_path)
             ref   = ref_xform.GetPrim()
-            ref_children = list(ref.GetChildren())
 
+            is_instance = ref.IsInstance()
+
+            # 1. Fetch children based on whether it is an instance or a normal prim
+            if is_instance:
+                # Instances hide their children to save memory. We must query the Prototype (master blueprint).
+                prototype = ref.GetPrototype()
+                ref_children = list(prototype.GetChildren()) if prototype else []
+                instance_msg = f" (Instance, querying prototype: {prototype.GetPath() if prototype else 'None'})"
+            else:
+                # Standard prim, we can get children directly.
+                ref_children = list(ref.GetChildren())
+                instance_msg = ""
+
+            # 2. Log the status of the outer prim
             carb.log_warn(
                 f"[UsdSpawner][DEBUG] outer  valid={outer.IsValid()}  "
                 f"active={outer.IsActive()}  type='{outer.GetTypeName()}'"
             )
+
+            # 3. Log the status of the reference (now includes instance_msg!)
             carb.log_warn(
                 f"[UsdSpawner][DEBUG] ref    valid={ref.IsValid()}  "
                 f"active={ref.IsActive()}  type='{ref.GetTypeName()}'  "
-                f"children={len(ref_children)}"
+                f"children={len(ref_children)}{instance_msg}"
             )
+
+            # 4. Error handling if children are still missing
             if not ref_children:
                 carb.log_error(
                     f"[UsdSpawner][DEBUG] Reference has NO children — "
@@ -1010,12 +1042,12 @@ class UsdSpawner:
                 for c in ref_children[:5]:
                     carb.log_warn(f"[UsdSpawner][DEBUG]   child: {c.GetPath()}  type={c.GetTypeName()}")
 
-            # Check visibility
+            # 5. Check visibility
             imageable = UsdGeom.Imageable(outer)
             vis = imageable.ComputeVisibility(Usd.TimeCode.Default())
             carb.log_warn(f"[UsdSpawner][DEBUG] visibility='{vis}'")
 
-            # Check world bounds (may be empty if geometry hasn't cooked yet)
+            # 6. Check world bounds (may be empty if geometry hasn't cooked yet)
             try:
                 from pxr import UsdGeom as _UG
                 bbox_cache = _UG.BBoxCache(
@@ -1051,13 +1083,14 @@ class UsdSpawner:
     # ------------------------------------------------------------------
     # Simulation Product Restocking
     # ------------------------------------------------------------------
-    def _restock_product(self, asset_key: str, quantity_ordered: int) -> bool:
+    def _restock_product(self, rack_info: dict, asset_key: str, quantity_ordered: int) -> bool:
         """
         Restocks a specific product across available store shelves using planogram data.
         Calculates theoretical spatial slots using direction vectors to support arbitrary rack rotations,
         faces existing valid stock forward, and spawns new stock in remaining slots.
 
         Args:
+            rack_info (dict): All required information about the rack (dimensions & planogram) for restocking
             asset_key (str): Unique identifier for the product asset.
             quantity_ordered (int): Total quantity of the product to restock across all shelves.
 
@@ -1065,23 +1098,18 @@ class UsdSpawner:
             bool: True if restocking process executed successfully, False otherwise.
         """
         # 1. Retrieve rack and planogram data
-        success, result = self._send_to_backend(f"/api/store-layout/{asset_key}", "GET")
-        if not success or not result.get("rack_ids"):
-            return False
+        if not rack_info or not asset_key or not quantity_ordered:
+            carb.log_error("[UsdSpawner] Required params missing")
+            return False, 0
 
-        rack_id = result["rack_ids"][0]
-
-        success, result = self._send_to_backend(f"/api/store-layout/racks/{rack_id}/planogram", "GET")
-        if not success:
-            return False
-
-        shelf_width = result.get("shelf_width")
-        shelf_depth = result.get("shelf_depth")
-        available_shelf_height = result.get("available_shelf_height")
-        shelves = result.get("shelves")
-        anchor = result.get("anchor") # Expected format: "(X, Y, Z)"
+        rack_id = rack_info.get("rack_id")
+        shelf_width = rack_info.get("shelf_width")
+        shelf_depth = rack_info.get("shelf_depth")
+        available_shelf_height = rack_info.get("available_shelf_height")
+        shelves = rack_info.get("shelves")
+        anchor = rack_info.get("anchor") # Expected format: "(X, Y, Z)"
         if not shelf_width or not shelf_depth or not shelves or not anchor or len(anchor) != 3 or not available_shelf_height:
-            carb.log_error(f"[UsdSpawner] Planogram missing required params for rack {rack_id}")
+            carb.log_error(f"[UsdSpawner] Missing required params for rack {rack_id}")
             return False, 0
 
 
@@ -1093,9 +1121,9 @@ class UsdSpawner:
         carb.log_warn("[UsdSpawner] ====================================================================================")
         carb.log_warn("[UsdSpawner] Restock Step 1 Complete")
         # 2. Extract normalized direction vectors for procedural spatial calculations
-        width_dir = result.get("shelf_width_direction", [1.0, 0.0, 0.0])
+        width_dir = rack_info.get("shelf_width_direction", [1.0, 0.0, 0.0])
         width_dir = [float(width_dir[0]), float(width_dir[1]), float(width_dir[2])]
-        depth_dir = result.get("shelf_depth_direction", [0.0, 1.0, 0.0])
+        depth_dir = rack_info.get("shelf_depth_direction", [0.0, 1.0, 0.0])
         depth_dir = [float(depth_dir[0]), float(depth_dir[1]), float(depth_dir[2])]
         remaining_to_spawn = quantity_ordered
         total_spawned = 0
@@ -1205,7 +1233,7 @@ class UsdSpawner:
             carb.log_warn("[UsdSpawner] Restock Step 5 Complete")
             # 6. Generate the Theoretical Grid Pool
             max_depth_capacity = int(shelf_depth // (item_d + item_margin))
-            carb.log_warn(f"[UsdSpawner] Step 6: Max Depth Capacity: {max_depth_capacity}")
+            carb.log_warn(f"[UsdSpawner] Step 6: Max Depth Capacity: {max_depth_capacity}, Facing coung: {target_facing_count}")
             grid_slots = []
 
             for row in range(max_depth_capacity):
@@ -1226,7 +1254,7 @@ class UsdSpawner:
 
             # Sort grid slots (lowest row_index represents the back of the shelf)
             grid_slots.sort(key=lambda slot: slot["row_index"], reverse=True)
-            carb.log_warn(f"[UsdSpawner] Step 6: Grid slots: {grid_slots}")
+            carb.log_warn(f"[UsdSpawner] Step 6: {len(grid_slots)} Grid slots available: {grid_slots}")
             carb.log_warn("[UsdSpawner] Restock Step 6 Complete")
 
             # 7. Facing: Align valid existing stock to the frontmost available slots

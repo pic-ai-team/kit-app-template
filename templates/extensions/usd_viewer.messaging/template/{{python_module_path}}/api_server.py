@@ -40,6 +40,7 @@ class APIServer:
         GET  /robot/navigation/route     — let the robot navigate along a route
         GET  /robot/incident-detection/routes  - receive all incident detection routes
 
+
         POST /simulation/incident        — spawn an incident
         POST /simulation/buy             — simulate someone buying items in the store
         POST /simulation/restock         — simulate a delivery truck restocking the store
@@ -195,7 +196,7 @@ class APIServer:
             model (optional): Vision model — "qwen" (default) or "cosmos".
 
         Returns JSON with per-rack analysis including rack_id, rack_name,
-        stock_level, shelf_rows with product stock ratios.
+        stock_level, shelf_levels with product stock ratios.
         """
         from aiohttp import web
 
@@ -599,6 +600,7 @@ class APIServer:
             data = await request.json()
             asset_key = data.get("asset_key", "").strip()
             quantity = data.get("quantity", 1)
+            rack_info = data.get("rack_info")
 
             # Get custom messaging object
             mgr = None
@@ -610,11 +612,11 @@ class APIServer:
 
             if mgr is None:
                 return web.json_response(
-                    {"error": "CustomMessageManager not available", "routes": {}, "count": 0},
+                    {"success": False, "error": "CustomMessageManager not available", "routes": {}, "count": 0},
                     status=503,
                 )
 
-            success, qty_restocked = mgr._usd_spawner._restock_product(asset_key, quantity)
+            success, qty_restocked = mgr._usd_spawner._restock_product(rack_info, asset_key, quantity)
             return web.json_response({"success": success, "qty_restocked": qty_restocked})
         except Exception as e:
             carb.log_error(f"[APIServer] Restock Products Error: {e}")
