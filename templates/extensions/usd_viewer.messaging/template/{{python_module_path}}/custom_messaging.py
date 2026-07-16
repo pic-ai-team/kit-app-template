@@ -2386,33 +2386,11 @@ class CustomMessageManager:
             else:
                 carb.log_warn("[ReloadStage] No active stage — nothing to reload")
 
-            # 6. Reinitialise USD spawner (clears in-memory tracking)
+            # 6. Reinitialise USD spawner (clears in-memory tracking and initializes rack item population)
             if self._usd_spawner:
                 self._usd_spawner.on_shutdown()
             self._usd_spawner = UsdSpawner()
 
-            # Keep UsdSpawner's deferred scan enabled and also attempt a
-            # best-effort immediate scan once /World has children.
-            # Duplicate PUTs are safe because backend PUT fully replaces state.
-            carb.log_info('[ReloadStage] Waiting for stage content before inventory scan...')
-            scanned = False
-            for attempt in range(300):
-                await omni.kit.app.get_app().next_update_async()
-                s = omni.usd.get_context().get_stage()
-                if s:
-                    world = s.GetPrimAtPath("/World")
-                    if world and list(world.GetChildren()):
-                        carb.log_info(
-                            f'[ReloadStage] /World children detected on frame {attempt} — running inventory scan'
-                        )
-                        try:
-                            self._usd_spawner._scan_stage_to_inventory()
-                            scanned = True
-                        except Exception as e:
-                            carb.log_warn(f'[ReloadStage] Inventory scan failed: {e}')
-                        break
-            if not scanned:
-                carb.log_warn('[ReloadStage] Stage content not ready in 300 frames; deferred scan remains active')
 
             # 7. Send success response (stage OPENED event will trigger the
             #    normal loadingState/openedStageResult flow for the frontend)

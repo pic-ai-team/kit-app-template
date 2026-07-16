@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 from typing import Optional
-
+import omni.kit.app
 import carb
 
 # Default port — can be overridden via /app/cctv/port setting
@@ -44,6 +44,9 @@ class APIServer:
         POST /simulation/incident        — spawn an incident
         POST /simulation/buy             — simulate someone buying items in the store
         POST /simulation/restock         — simulate a delivery truck restocking the store
+                                           (also used for initial store population)
+
+        GET  /store/populate-complete    — request a stage scan to inventory after store is populated
 
     """
 
@@ -85,6 +88,7 @@ class APIServer:
         app.router.add_delete("/simulation/incident", self._handle_resolve_incident)
         app.router.add_post("/simulation/buy", self._handle_buy_product)
         app.router.add_post("/simulation/restock", self._handle_restock_product)
+        app.router.add_post("/store/populate-complete", self._handle_store_populated)
 
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -601,6 +605,7 @@ class APIServer:
             asset_key = data.get("asset_key", "").strip()
             quantity = data.get("quantity", 1)
             rack_info = data.get("rack_info")
+            skip_inventory_update = data.get("skip_inventory_update", False)
 
             # Get custom messaging object
             mgr = None
@@ -616,12 +621,44 @@ class APIServer:
                     status=503,
                 )
 
-            success, qty_restocked = mgr._usd_spawner._restock_product(rack_info, asset_key, quantity)
+            success, qty_restocked = mgr._usd_spawner._restock_product(rack_info, asset_key, quantity, skip_inventory_update=skip_inventory_update)
             return web.json_response({"success": success, "qty_restocked": qty_restocked})
         except Exception as e:
             carb.log_error(f"[APIServer] Restock Products Error: {e}")
             return web.json_response(
                 {"success": False, "error": f"Restocking products failed: {e}", "qty_restocked": 0},
+                status=500,
+            )
+
+
+    async def _handle_store_populated(self, request):
+        """Spawm a given quantity of a product in the store"""
+        from aiohttp import web
+        try:
+
+            # Get custom messaging object
+            mgr = None
+            try:
+                from . import custom_messaging as _cm_mod
+                mgr = getattr(_cm_mod, '_manager_instance', None)
+            except Exception:
+                pass
+
+            if mgr is None:
+                return web.json_response(
+                    {"success": False, "error": "CustomMessageManager not available", "routes": {}, "count": 0},
+                    status=503,
+                )
+            # Wait for 5 frames before scanning the stage (give items time to finish spawning)
+            for _ in range(5):
+                await omni.kit.app.get_app().next_update_async()
+
+            mgr._usd_spawner._scan_stage_to_inventory()
+            return web.json_response({"success": "True"})
+        except Exception as e:
+            carb.log_error(f"[APIServer] Scanning stage to inventory error: {e}")
+            return web.json_response(
+                {"success": False, "error": "Couldn't scan stage to inventory"},
                 status=500,
             )
 

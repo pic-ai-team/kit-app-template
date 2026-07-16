@@ -537,7 +537,7 @@ class UsdSpawner:
     # ------------------------------------------------------------------
 
     def _on_update(self, event) -> None:
-        """Runs every frame until the stage is loaded, then scans once."""
+        """Runs every frame until the stage is loaded, then requests store rack population"""
         if not self._scan_pending:
             return
         stage = omni.usd.get_context().get_stage()
@@ -548,17 +548,12 @@ class UsdSpawner:
             return
         if not list(world.GetChildren()):
             return
-        # Stage is loaded and has content - Spawn store inventory
-        self._populate_initial_store_inventory()
+        # Stage is loaded and has content - Initialize rack item population
+        self._send_to_backend("/api/store-layout/populate-racks", "GET")
+
         self._scan_pending = False
         self._update_sub = None  # release subscription
 
-    def _populate_initial_store_inventory(self) -> None:
-        """
-        Request the agent backend to populate the store with assets according to the planogram
-        """
-        # 1. Retrieve planogram information with initial product stock
-        self._send_to_backend("/api/store-layout/populate_racks", "GET")
 
 
     def _scan_stage_to_inventory(self) -> None:
@@ -592,15 +587,19 @@ class UsdSpawner:
             if prim_path == "/World/Prototypes" or prim_path.startswith("/World/Prototypes/"):
                 return
 
-            # Resolve asset_key from prim name (strip trailing _N suffix first)
-            base = re.sub(r"_\d+$", "", prim_name)
-            asset_key = (
-                _STEM_TO_KEY.get(prim_name)
-                or _STEM_TO_KEY.get(base)
-                or _STEM_TO_KEY.get(prim_name.replace("-", "_"))
-                or _STEM_TO_KEY.get(base.replace("-", "_"))
-                or ""
-            )
+            # 1. Check if prim has asset_key (added in _spawn_usd)
+            asset_key = prim.GetCustomDataByKey("asset_key")
+
+            if not asset_key:
+            # Fallback: Resolve asset_key from prim name (strip trailing _N suffix first)
+                base = re.sub(r"_\d+$", "", prim_name)
+                asset_key = (
+                    _STEM_TO_KEY.get(prim_name)
+                    or _STEM_TO_KEY.get(base)
+                    or _STEM_TO_KEY.get(prim_name.replace("-", "_"))
+                    or _STEM_TO_KEY.get(base.replace("-", "_"))
+                    or ""
+                )
 
             if asset_key:
                 # Known product — record with position and shelf group
@@ -608,23 +607,8 @@ class UsdSpawner:
                 rack_id = None
                 shelf_row = None
 
-                # Prefer explicit prim attributes; keep None when missing.
-                try:
-                    rack_attr = prim.GetAttribute("rack_id")
-                    if rack_attr and rack_attr.HasAuthoredValueOpinion():
-                        _rack_val = rack_attr.Get(Usd.TimeCode.Default())
-                        if _rack_val is not None:
-                            _rack_str = str(_rack_val).strip()
-                            rack_id = _rack_str or None
-
-                    shelf_attr = prim.GetAttribute("shelf_row")
-                    if shelf_attr and shelf_attr.HasAuthoredValueOpinion():
-                        _shelf_val = shelf_attr.Get(Usd.TimeCode.Default())
-                        if _shelf_val is not None:
-                            _shelf_str = str(_shelf_val).strip()
-                            shelf_row = _shelf_str or None
-                except Exception as exc:
-                    carb.log_warn(f"[UsdSpawner] Stage scan: attribute read failed for {prim_path}: {exc}")
+                rack_id = prim.GetCustomDataByKey("rack_id")
+                shelf_row = prim.GetCustomDataByKey("shelf_row")
 
                 try:
                     xform_api = UsdGeom.Xformable(prim)
@@ -648,17 +632,29 @@ class UsdSpawner:
                 # e.g. Pringles_Lobster has Geometry/Mesh, Mesh_01 … Mesh_07 = 8 cans.
                 unit_count = 1
                 try:
-                    for ch in prim.GetChildren():
-                        if ch.GetName().lower() == "geometry":
-                            mesh_children = [
-                                m for m in ch.GetChildren()
-                                if m.GetName().startswith("Mesh")
-                            ]
-                            if len(mesh_children) > 1:
-                                unit_count = len(mesh_children)
-                            break
+                    search_root = prim
+                    ref_child = prim.GetChild("Ref")
+                    if ref_child and ref_child.IsInstance():
+                        proto = ref_child.GetPrototype()
+                        if proto:
+                            search_root = proto
+
+                    def _find_geometry_and_count(node):
+                        nonlocal unit_count
+                        for ch in node.GetChildren():
+                            if ch.GetName().lower() == "geometry":
+                                mesh_children = [m for m in ch.GetChildren() if m.GetName().startswith("Mesh")]
+                                if len(mesh_children) > 1:
+                                    unit_count = len(mesh_children)
+                                return True
+                            if _find_geometry_and_count(ch):
+                                return True
+                        return False
+
+                    _find_geometry_and_count(search_root)
                 except Exception:
                     pass
+
 
                 inventory[prim_path] = {
                     "asset_key":   asset_key,
@@ -667,7 +663,7 @@ class UsdSpawner:
                     "position":    position,
                     "prim_name":   prim_name,
                     "rack_id":     rack_id,
-                    "shelf_row": shelf_row,
+                    "shelf_row":   shelf_row,
                     "unit_count":  unit_count,
                     "source":      "stage_scan",
                 }
@@ -810,11 +806,12 @@ class UsdSpawner:
                 return prim_path
 
     def _spawn_usd(
-        self, usd_path: str, prim_name: str, position: "Gf.Vec3d",
+        self, usd_path: str, asset_key: str, position: "Gf.Vec3d",
         rotation: "Gf.Rotation" = None,
         snap_y_to: float = None,
         rack_id: str = None,
-        shelf_row: int = None
+        shelf_row: int = None,
+        skip_inventory_update: bool = False
     ) -> str:
         """
         Reference `usd_path` into the current stage at `position`.
@@ -832,6 +829,9 @@ class UsdSpawner:
         during replace so the replacement sits at the same shelf height as the
         original item regardless of pivot offsets.  When omitted the existing
         floor-snap-to-Y=0 logic runs instead.
+
+        Optional `skip_inventory_update` is only used for the initial store population since whole stage will be
+        scanned and sent to inventory anyway
         """
         stage = omni.usd.get_context().get_stage()
 
@@ -839,10 +839,18 @@ class UsdSpawner:
         if not stage.GetPrimAtPath("/World"):
             UsdGeom.Xform.Define(stage, "/World")
 
-        prim_path = self._make_unique_prim_path(prim_name)
+        prim_path = self._make_unique_prim_path(asset_key)
 
         # Outer Xform — owns the world-space translation (and rotation when replacing).
         xform = UsdGeom.Xform.Define(stage, prim_path)
+
+        # Tag prim with its prim name (asset_key) for later lookup
+        xform.GetPrim().SetCustomDataByKey("asset_key", asset_key)
+
+        if rack_id:
+            xform.GetPrim().SetCustomDataByKey("rack_id", rack_id)
+        if shelf_row and isinstance(shelf_row, int):
+            xform.GetPrim().SetCustomDataByKey("shelf_row", shelf_row)
 
         # Safely get or add the translate op (avoids duplicate-op crash on reload)
         translate_op = next(
@@ -861,10 +869,10 @@ class UsdSpawner:
         # Priority: JSON file (self._rotation_corrections) > ASSET_SPAWN_ROTATION_CORRECTION
         effective_rotation = rotation  # may be None
 
-        if prim_name in self._rotation_corrections:
+        if asset_key in self._rotation_corrections:
             # JSON-saved absolute Euler correction (set via browser rotation panel).
             # Applied as absolute orientation — overrides world rotation for this asset.
-            rc = self._rotation_corrections[prim_name]
+            rc = self._rotation_corrections[asset_key]
             ex = float(rc.get("euler_x", 0))
             ey = float(rc.get("euler_y", 0))
             ez = float(rc.get("euler_z", 0))
@@ -874,7 +882,7 @@ class UsdSpawner:
             effective_rotation = rot_x * rot_y * rot_z
             carb.log_warn(
                 f"[UsdSpawner] Spawn: using saved rotation correction"
-                f" X={ex}° Y={ey}° Z={ez}° for '{prim_name}'"
+                f" X={ex}° Y={ey}° Z={ez}° for '{asset_key}'"
             )
 
         # Apply effective rotation (inherited + correction) if any.
@@ -890,8 +898,8 @@ class UsdSpawner:
 
         # Apply saved scale correction on the outer Xform (scale is innermost, applied first).
         # Multiplies with the /Ref child's 100x unit-conversion scale.
-        if prim_name in self._scale_corrections:
-            sc = self._scale_corrections[prim_name]
+        if asset_key in self._scale_corrections:
+            sc = self._scale_corrections[asset_key]
             sx = float(sc.get("scale_x", 1.0))
             sy = float(sc.get("scale_y", 1.0))
             sz = float(sc.get("scale_z", 1.0))
@@ -901,7 +909,7 @@ class UsdSpawner:
                     scale_op.Set(Gf.Vec3f(sx, sy, sz))
                     carb.log_warn(
                         f"[UsdSpawner] Spawn: applied scale correction"
-                        f" ({sx},{sy},{sz}) for '{prim_name}'"
+                        f" ({sx},{sy},{sz}) for '{asset_key}'"
                     )
                 except Exception as sc_err:
                     carb.log_warn(f"[UsdSpawner] Spawn: could not apply scale: {sc_err}")
@@ -913,7 +921,7 @@ class UsdSpawner:
         ref_xform = UsdGeom.Xform.Define(stage, ref_path)
         ref_prim = ref_xform.GetPrim()
 
-        _unit_scale = _ASSET_UNIT_SCALE.get(prim_name, 100.0)
+        _unit_scale = _ASSET_UNIT_SCALE.get(asset_key, 100.0)
         ref_xform.AddScaleOp().Set(Gf.Vec3f(_unit_scale, _unit_scale, _unit_scale))
         ref_prim.GetReferences().AddReference(usd_path)
 
@@ -974,14 +982,14 @@ class UsdSpawner:
                 if h_adjusted:
                     translate_op.Set(Gf.Vec3d(*cur))
                     carb.log_warn(
-                        f"[UsdSpawner] Spawn: horizontal bbox-center correction applied for '{prim_name}'"
+                        f"[UsdSpawner] Spawn: horizontal bbox-center correction applied for '{asset_key}'"
                     )
         except Exception as snap_err:
             carb.log_warn(f"[UsdSpawner] Floor-snap failed (asset may be partially underground): {snap_err}")
 
         # Apply per-asset translation offset (saved via browser rotation panel).
-        if prim_name in self._rotation_corrections:
-            rc = self._rotation_corrections[prim_name]
+        if asset_key in self._rotation_corrections:
+            rc = self._rotation_corrections[asset_key]
             ox = float(rc.get("offset_x", 0))
             oy = float(rc.get("offset_y", 0))
             oz = float(rc.get("offset_z", 0))
@@ -997,9 +1005,10 @@ class UsdSpawner:
             f"[UsdSpawner] Spawned '{usd_path}' → '{prim_path}'  pos={position}"
         )
 
-        # Record for later deletion (in-memory + persistent inventory)
-        self._spawned_prims.setdefault(prim_name, []).append(prim_path)
-        self._inventory_add(prim_path, prim_name, usd_path, position, rack_id=rack_id, shelf_row=shelf_row)
+        if not skip_inventory_update:
+            # Record for later deletion (in-memory + persistent inventory)
+            self._spawned_prims.setdefault(asset_key, []).append(prim_path)
+            self._inventory_add(prim_path, asset_key, usd_path, position, rack_id=rack_id, shelf_row=shelf_row)
 
         # ── Debug: report what actually landed on stage ──────────────────
         try:
@@ -1083,7 +1092,7 @@ class UsdSpawner:
     # ------------------------------------------------------------------
     # Simulation Product Restocking
     # ------------------------------------------------------------------
-    def _restock_product(self, rack_info: dict, asset_key: str, quantity_ordered: int) -> bool:
+    def _restock_product(self, rack_info: dict, asset_key: str, quantity_ordered: int, skip_inventory_update: bool = False) -> tuple[bool, int]:
         """
         Restocks a specific product across available store shelves using planogram data.
         Calculates theoretical spatial slots using direction vectors to support arbitrary rack rotations,
@@ -1093,6 +1102,8 @@ class UsdSpawner:
             rack_info (dict): All required information about the rack (dimensions & planogram) for restocking
             asset_key (str): Unique identifier for the product asset.
             quantity_ordered (int): Total quantity of the product to restock across all shelves.
+            skip_inventory_update (bool) is only used for the initial store population since whole stage will be
+        scanned and sent to inventory anyway
 
         Returns:
             bool: True if restocking process executed successfully, False otherwise.
@@ -1285,7 +1296,7 @@ class UsdSpawner:
 
                 # Use your existing spawn function directly
                 carb.log_warn(f"[UsdSpawner] Step 8: spawn {asset_key} to {spawn_pos}")
-                new_prim_path = self._spawn_usd(usd_path, asset_key, spawn_pos, rack_id=rack_id, shelf_row=shelf_row)
+                new_prim_path = self._spawn_usd(usd_path, asset_key, spawn_pos, rack_id=rack_id, shelf_row=shelf_row, skip_inventory_update=skip_inventory_update)
                 stage = omni.usd.get_context().get_stage()
                 new_prim = stage.GetPrimAtPath(new_prim_path)
                 self._rotate_prim_to_face_shelf_front(new_prim, depth_dir)
@@ -1874,13 +1885,13 @@ class UsdSpawner:
         """
         payload          = event.payload
         target_path      = str(payload.get("target_prim_path", ""))
-        prim_name        = str(payload.get("prim_name", ""))
+        asset_key        = str(payload.get("prim_name", ""))
 
         carb.log_info(
-            f"[UsdSpawner] replaceUsdRequest  target={target_path}  new={prim_name}"
+            f"[UsdSpawner] replaceUsdRequest  target={target_path}  new={asset_key}"
         )
 
-        if not target_path or not prim_name:
+        if not target_path or not asset_key:
             self._reply_replace({
                 "result": "error",
                 "error": "target_prim_path and prim_name are required",
@@ -1888,11 +1899,11 @@ class UsdSpawner:
             })
             return
 
-        usd_path = ASSET_LIBRARY.get(prim_name)
+        usd_path = ASSET_LIBRARY.get(asset_key)
         if not usd_path:
             self._reply_replace({
                 "result": "error",
-                "error": f"No USD path for asset '{prim_name}'. Add it to ASSET_LIBRARY.",
+                "error": f"No USD path for asset '{asset_key}'. Add it to ASSET_LIBRARY.",
                 "prim_path": "", "position": [0, 0, 0],
             })
             return
@@ -1939,7 +1950,7 @@ class UsdSpawner:
 
         # Spawn the new asset at the original world position with the same rotation.
         try:
-            new_prim_path = self._spawn_usd(usd_path, prim_name, position, rotation=rotation, snap_y_to=snap_y_to)
+            new_prim_path = self._spawn_usd(usd_path, asset_key, position, rotation=rotation, snap_y_to=snap_y_to)
             self._reply_replace({
                 "result":    "success",
                 "prim_path": new_prim_path,
@@ -1972,10 +1983,10 @@ class UsdSpawner:
         payload      = event.payload
         source_paths = list(payload.get("source_paths", []))
         source_key   = str(payload.get("source_key", ""))
-        prim_name    = str(payload.get("prim_name", ""))
+        asset_key    = str(payload.get("prim_name", ""))
 
         carb.log_info(
-            f"[UsdSpawner] replaceAllUsdRequest  target={prim_name}  "
+            f"[UsdSpawner] replaceAllUsdRequest  target={asset_key}  "
             f"source_key={source_key}  backend_paths={len(source_paths)}: {source_paths}"
         )
         carb.log_info(f"[UsdSpawner] _spawned_prims: { {k: v for k, v in self._spawned_prims.items()} }")
@@ -2008,14 +2019,14 @@ class UsdSpawner:
 
         carb.log_warn(
             f"[UsdSpawner] replaceAllUsdRequest after expansion: "
-            f"{len(source_paths)} prim(s) to replace: {source_paths}  →  new='{prim_name}'  usd='{ASSET_LIBRARY.get(prim_name)}'"
+            f"{len(source_paths)} prim(s) to replace: {source_paths}  →  new='{asset_key}'  usd='{ASSET_LIBRARY.get(asset_key)}'"
         )
 
-        usd_path = ASSET_LIBRARY.get(prim_name)
+        usd_path = ASSET_LIBRARY.get(asset_key)
         if not usd_path:
             get_eventdispatcher().dispatch_event("replaceAllUsdResponse", payload={
                 "result": "error", "count": 0, "prim_paths": [],
-                "error": f"No USD path for asset '{prim_name}'. Add it to ASSET_LIBRARY.",
+                "error": f"No USD path for asset '{asset_key}'. Add it to ASSET_LIBRARY.",
             })
             return
 
@@ -2063,7 +2074,7 @@ class UsdSpawner:
 
             # Spawn new asset at the original world position with the same rotation.
             try:
-                new_path = self._spawn_usd(usd_path, prim_name, position, rotation=rotation, snap_y_to=snap_y_to)
+                new_path = self._spawn_usd(usd_path, asset_key, position, rotation=rotation, snap_y_to=snap_y_to)
                 replaced.append(new_path)
                 carb.log_warn(f"[UsdSpawner] ReplaceAll: OK  {target_path} → {new_path}  pos={position}")
             except Exception as spawn_err:
@@ -2087,20 +2098,20 @@ class UsdSpawner:
         payload = event.payload
         screen_x  = float(payload.get("screen_x",  0.5))
         screen_y  = float(payload.get("screen_y",  0.5))
-        prim_name = str(payload.get("prim_name", "SpawnedAsset"))
+        asset_key = str(payload.get("prim_name", "SpawnedAsset"))
 
         # Resolve asset path: prefer local ASSET_LIBRARY (Kit controls paths),
         # fall back to whatever usd_path the browser forwarded.
-        usd_path = ASSET_LIBRARY.get(prim_name) or str(payload.get("usd_path", ""))
+        usd_path = ASSET_LIBRARY.get(asset_key) or str(payload.get("usd_path", ""))
 
         carb.log_info(
             f"[UsdSpawner] spawnUsdRequest  screen=({screen_x:.3f},{screen_y:.3f})"
-            f"  name={prim_name}  resolved_path={usd_path}"
+            f"  name={asset_key}  resolved_path={usd_path}"
         )
 
         if not usd_path:
             self._reply({"result": "error",
-                         "error": f"No USD path for asset '{prim_name}'. "
+                         "error": f"No USD path for asset '{asset_key}'. "
                                    "Add it to ASSET_LIBRARY in usd_spawner.py.",
                          "prim_path": "", "position": [0, 0, 0]})
             return
@@ -2112,7 +2123,7 @@ class UsdSpawner:
             return
 
         try:
-            prim_path = self._spawn_usd(usd_path, prim_name, position)
+            prim_path = self._spawn_usd(usd_path, asset_key, position)
             self._reply({
                 "result":    "success",
                 "prim_path": prim_path,
